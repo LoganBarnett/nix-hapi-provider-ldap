@@ -55,7 +55,10 @@ git remote add origin ssh://git@gitea.proton:2222/$USER/nix-hapi-provider-ldap.g
   NixOS module, added =openldap= to =devPackages=.
 - Deleted =nix/modules/web.nix= and =nix/packages/web.nix=.
 
-** TODO Update workspace metadata
+** DONE Update workspace metadata
+:PROPERTIES:
+:CREATED: 2026-03-28
+:END:
 
 Edit the [[workspace.package]] block in the root =Cargo.toml=:
 

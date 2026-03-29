@@ -8,9 +8,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Logan Barnett <logustus@gmail.com>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/yourusername/nix-hapi-provider-ldap"
+repository = "https://github.com/LoganBarnett/nix-hapi-provider-ldap"
 
 [workspace.dependencies]
 # Logging and tracing
