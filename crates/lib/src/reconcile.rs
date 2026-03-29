@@ -108,6 +108,22 @@ pub fn diff(
     }
   }
 
+  // Warn about group members that reference users outside the desired set.
+  let desired_user_keys: HashSet<&str> =
+    desired.users.keys().map(|s| s.as_str()).collect();
+  for (cn, group) in &desired.groups {
+    for member in &group.members {
+      if !desired_user_keys.contains(member.as_str()) {
+        tracing::warn!(
+          group = %cn,
+          member = %member,
+          "Group references member not present in desired users; \
+           member may already exist from a previous run",
+        );
+      }
+    }
+  }
+
   // Reconcile groups.
   for (cn, group) in &desired.groups {
     let dn = group_dn(cn, base_dn);
@@ -211,6 +227,7 @@ fn resolve_user(
   }
 
   attrs.insert("cn".to_string(), resolve_field!("cn", user.cn));
+  attrs.insert("sn".to_string(), resolve_field!("sn", user.sn));
   attrs.insert("mail".to_string(), resolve_field!("mail", user.mail));
   attrs.insert(
     "userPassword".to_string(),
@@ -380,6 +397,7 @@ fn with_user_object_classes(
       "inetOrgPerson".to_string(),
       "organizationalPerson".to_string(),
       "person".to_string(),
+      "top".to_string(),
     ]
   });
   attrs
@@ -394,7 +412,10 @@ fn group_to_attr_map(
   base_dn: &str,
 ) -> HashMap<String, Vec<String>> {
   let mut attrs: HashMap<String, Vec<String>> = HashMap::new();
-  attrs.insert("objectClass".to_string(), vec!["groupOfNames".to_string()]);
+  attrs.insert(
+    "objectClass".to_string(),
+    vec!["groupOfNames".to_string(), "top".to_string()],
+  );
   attrs.insert("cn".to_string(), vec![cn.to_string()]);
 
   if let Some(desc) = group.description.value() {
@@ -451,6 +472,9 @@ mod tests {
   fn make_user(cn: FieldValue, mail: FieldValue, pw: FieldValue) -> UserEntry {
     UserEntry {
       cn,
+      sn: FieldValue::Managed {
+        value: "Test".to_string(),
+      },
       mail,
       user_password: pw,
       login_shell: None,

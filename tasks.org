@@ -237,3 +237,58 @@ Both must succeed with no errors.
   - Test: user with multi-valued extra field, assert plan is empty when
     desired matches live.
   - Fix: ~diff_attrs~ should handle multi-valued attributes properly.
+
+** DONE Add =sn= as required field on =UserEntry=            :hardening:ldap:
+:PROPERTIES:
+:CREATED: 2026-03-28
+:END:
+
+=sn= is MUST for =inetOrgPerson=.  Previously it could only be provided via
+=extra_fields= with no compile-time or plan-time guarantee.  Now it is a named
+field on =UserEntry= and resolved alongside =cn= in =resolve_user()=.
+
+** DONE Add =top= to objectClass sets to prevent spurious diffs :hardening:ldap:
+:PROPERTIES:
+:CREATED: 2026-03-28
+:END:
+
+LDAP servers auto-include =top= in returned =objectClass= sets.  Without it
+in our desired set, =diff_multi_attrs= sees a set mismatch every cycle.  Added
+=top= to both =with_user_object_classes()= and =group_to_attr_map()=.
+
+** DONE Validate LDAP URL format in config                   :hardening:ldap:
+:PROPERTIES:
+:CREATED: 2026-03-28
+:END:
+
+=from_resolved_config()= now validates that the URL starts with =ldap://=,
+=ldaps://=, or =ldapi://=.  Invalid URLs fail fast with a clear message
+instead of producing a confusing connection error.
+
+** DONE Improve connection error messages                    :hardening:ldap:
+:PROPERTIES:
+:CREATED: 2026-03-28
+:END:
+
+Bind failures now include the URL and bind DN in the error message and
+pattern-match common LDAP result codes: rc=49 → "invalid credentials", rc=32
+→ "bind DN not found".
+
+** DONE Warn when group members reference unknown desired users :hardening:ldap:
+:PROPERTIES:
+:CREATED: 2026-03-28
+:END:
+
+At plan time, =diff()= now collects the desired user key set and emits a
+=tracing::warn= for any group member not in the set.  This catches typos and
+ordering issues without hard-erroring (the member might exist from a previous
+run).
+
+** DONE Nix integration layer                                     :nix:ldap:
+:PROPERTIES:
+:CREATED: 2026-03-28
+:END:
+
+Created =nix/lib/default.nix= with =mkLdapProvider=, =mkLdapUser=, and
+=mkLdapGroup= helpers that enforce required fields at Nix eval time.  Exported
+as =lib= from =flake.nix=.

@@ -19,6 +19,7 @@ pub struct LdapDesiredState {
 #[serde(rename_all = "camelCase")]
 pub struct UserEntry {
   pub cn: FieldValue,
+  pub sn: FieldValue,
   pub mail: FieldValue,
   pub user_password: FieldValue,
 

@@ -521,6 +521,38 @@ fn nested_ou_entries_excluded_from_list_live() {
   );
 }
 
+/// A group referencing a member not in the desired users set should still
+/// produce a valid plan (the warning is logged but does not cause an error).
+#[test]
+fn group_referencing_unknown_user_plans_successfully() {
+  let server = TestLdapServer::start().expect("start slapd");
+  server.initialize().expect("initialize base structure");
+
+  let provider = make_provider();
+  let config = make_config(&server);
+  let live = provider.list_live(&config, &[]).expect("list_live");
+
+  // alice is in desired users, but the group references both alice and
+  // "ghost" which is not in desired users.
+  let desired_state = desired_with_groups(
+    serde_json::json!({
+      "alice": alice("Alice Smith", managed("secret")),
+    }),
+    serde_json::json!({
+      "staff": group("Staff group", &["alice", "ghost"]),
+    }),
+  );
+
+  let plan = provider
+    .plan(&desired_state, &live, &NixHapiMeta::default(), &config)
+    .expect("plan should succeed despite unknown member reference");
+
+  assert!(
+    !plan.changes.is_empty(),
+    "Expected plan changes for new user and group"
+  );
+}
+
 /// Creating a group with multiple members, applying, then planning again with
 /// the same desired state must produce an empty plan.  This validates that
 /// multi-valued attributes like `member` are compared with set equality.
