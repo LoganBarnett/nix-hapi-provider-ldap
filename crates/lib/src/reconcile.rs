@@ -130,11 +130,7 @@ pub fn diff(
         to_add.push((dn, desired_attrs));
       }
       Some(live_entry) => {
-        let mock_resolved: HashMap<String, ResolvedFieldValue> = desired_attrs
-          .iter()
-          .map(|(k, v)| (k.clone(), ResolvedFieldValue::Managed(v.join("\n"))))
-          .collect();
-        let mods = diff_attrs(&mock_resolved, live_entry);
+        let mods = diff_multi_attrs(&desired_attrs, live_entry);
         if !mods.is_empty() {
           let field_changes = mods
             .iter()
@@ -314,6 +310,39 @@ fn diff_attrs(
   }
 
   mods
+}
+
+/// Compares desired multi-valued attributes against live, using set equality.
+/// Used for group reconciliation where attributes like `member` and
+/// `objectClass` are inherently multi-valued.
+fn diff_multi_attrs(
+  desired: &HashMap<String, Vec<String>>,
+  live_entry: &HashMap<String, Vec<String>>,
+) -> Vec<AttrMod> {
+  desired
+    .iter()
+    .filter_map(|(attr, desired_vals)| {
+      let desired_set: HashSet<&str> =
+        desired_vals.iter().map(|s| s.as_str()).collect();
+      let live_vals = live_entry.get(attr);
+      let live_set: HashSet<&str> = live_vals
+        .map(|v| v.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+
+      (desired_set != live_set).then(|| {
+        let op = if live_vals.is_none() {
+          AttrModOp::Add
+        } else {
+          AttrModOp::Replace
+        };
+        AttrMod {
+          attr: attr.clone(),
+          op,
+          values: desired_vals.clone(),
+        }
+      })
+    })
+    .collect()
 }
 
 fn resolved_to_attr_map(

@@ -1,6 +1,7 @@
 use ldap3::{LdapConn, LdapError, Mod, SearchEntry};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
+use tracing::warn;
 
 #[derive(Debug, Error)]
 pub enum OperationError {
@@ -33,16 +34,26 @@ pub enum OperationError {
   },
 }
 
-/// Adds an entry.  Treats "already exists" (rc=68) as success for idempotency.
+/// Adds an entry.  If the entry already exists (rc=68), falls back to a
+/// Modify that replaces each attribute so the entry ends up with the desired
+/// values rather than silently keeping stale ones.
 pub fn entry_add(
   ldap: &mut LdapConn,
   dn: &str,
   attrs: Vec<(&str, HashSet<&str>)>,
 ) -> Result<(), OperationError> {
-  match ldap.add(dn, attrs) {
+  let add_result = ldap.add(dn, attrs.clone());
+  match add_result {
     Ok(result) => match result.success() {
       Ok(_) => Ok(()),
-      Err(LdapError::LdapResult { result: ref r }) if r.rc == 68 => Ok(()),
+      Err(LdapError::LdapResult { result: ref r }) if r.rc == 68 => {
+        warn!(dn = %dn, "Entry already exists (rc=68); falling back to modify");
+        let mods: Vec<Mod<&str>> = attrs
+          .into_iter()
+          .map(|(attr, values)| Mod::Replace(attr, values))
+          .collect();
+        entry_modify(ldap, dn, mods)
+      }
       Err(e) => Err(OperationError::AddFailed {
         dn: dn.to_string(),
         source: e,
@@ -122,14 +133,14 @@ pub fn entry_get(
   }
 }
 
-/// Lists all DNs under `base_dn` (subtree search).
+/// Lists direct-child DNs under `base_dn` (one-level search).
 pub fn entry_list(
   ldap: &mut LdapConn,
   base_dn: &str,
 ) -> Result<Vec<String>, OperationError> {
   match ldap.search(
     base_dn,
-    ldap3::Scope::Subtree,
+    ldap3::Scope::OneLevel,
     "(objectClass=*)",
     vec!["1.1"],
   ) {

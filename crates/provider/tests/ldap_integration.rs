@@ -8,7 +8,7 @@ use nix_hapi_lib::{
   provider::{Provider, ResolvedConfig},
   subprocess::SubprocessProvider,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -49,6 +49,21 @@ fn initial(value: &str) -> serde_json::Value {
 /// Wraps a users map in the top-level desired-state shape, with no groups.
 fn desired(users: serde_json::Value) -> serde_json::Value {
   serde_json::json!({"users": users, "groups": {}})
+}
+
+/// Full desired-state shape with both users and groups.
+fn desired_with_groups(
+  users: serde_json::Value,
+  groups: serde_json::Value,
+) -> serde_json::Value {
+  serde_json::json!({"users": users, "groups": groups})
+}
+
+fn group(description: &str, members: &[&str]) -> serde_json::Value {
+  serde_json::json!({
+    "description": managed(description),
+    "members": members,
+  })
 }
 
 /// A minimal alice entry including `sn`, which is required by inetOrgPerson.
@@ -365,4 +380,192 @@ fn runbook_scrubs_bind_password() {
       step.command
     );
   }
+}
+
+/// When an Add is applied for an entry that already exists with wrong
+/// attributes, the entry_add fallback to Modify must correct the attributes.
+#[test]
+fn add_corrects_existing_entry_with_wrong_attributes() {
+  let server = TestLdapServer::start().expect("start slapd");
+  let mut ldap = server.initialize().expect("initialize base structure");
+
+  // Pre-create alice with wrong cn directly via LDAP.
+  let alice_dn = format!("uid=alice,ou=users,{}", server.base_dn);
+  ldap
+    .add(
+      &alice_dn,
+      vec![
+        (
+          "objectClass",
+          HashSet::from(["inetOrgPerson", "organizationalPerson", "person"]),
+        ),
+        ("uid", HashSet::from(["alice"])),
+        ("cn", HashSet::from(["WRONG"])),
+        ("sn", HashSet::from(["WRONG"])),
+        ("mail", HashSet::from(["wrong@example.org"])),
+        ("userPassword", HashSet::from(["oldpw"])),
+      ],
+    )
+    .expect("pre-create alice")
+    .success()
+    .expect("pre-create success");
+
+  let provider = make_provider();
+  let config = make_config(&server);
+
+  // Provider sees empty live users (alice exists but the plan will try Add
+  // because list_live + plan would normally see her).  Instead we force the
+  // scenario: build a plan from empty live, which produces an Add, then apply.
+  let empty_live = serde_json::json!({"users": {}, "groups": {}});
+  let desired_state = desired(
+    serde_json::json!({"alice": alice("Alice Smith", managed("secret"))}),
+  );
+
+  let mut plan = provider
+    .plan(&desired_state, &empty_live, &NixHapiMeta::default(), &config)
+    .expect("plan");
+  plan.instance_name = "test".to_string();
+
+  // The plan should contain an Add for alice.
+  let has_add = plan.changes.iter().any(|c| {
+    matches!(c, ResourceChange::Add { resource_id, .. } if resource_id == &alice_dn)
+  });
+  assert!(
+    has_add,
+    "Expected Add for pre-existing alice; got: {:?}",
+    plan.changes
+  );
+
+  // Apply should succeed (entry_add falls back to Modify on rc=68).
+  provider.apply(&plan, &config).expect("apply");
+
+  // Verify that alice now has the correct attributes.
+  let live_after = provider.list_live(&config, &[]).expect("list_live after");
+  assert_eq!(
+    live_after["users"]["alice"]["cn"],
+    serde_json::json!(["Alice Smith"]),
+    "cn should be corrected after Add fallback to Modify"
+  );
+}
+
+/// Entries in a sub-OU under ou=users must not appear in list_live; only direct
+/// children of ou=users should be returned.
+#[test]
+fn nested_ou_entries_excluded_from_list_live() {
+  let server = TestLdapServer::start().expect("start slapd");
+  let mut ldap = server.initialize().expect("initialize base structure");
+
+  // Create a sub-OU and a user inside it directly via LDAP.
+  let sub_ou_dn = format!("ou=admins,ou=users,{}", server.base_dn);
+  ldap
+    .add(
+      &sub_ou_dn,
+      vec![
+        ("objectClass", HashSet::from(["organizationalUnit", "top"])),
+        ("ou", HashSet::from(["admins"])),
+      ],
+    )
+    .expect("add sub-OU")
+    .success()
+    .expect("sub-OU success");
+
+  let deep_dn = format!("uid=deep,ou=admins,ou=users,{}", server.base_dn);
+  ldap
+    .add(
+      &deep_dn,
+      vec![
+        (
+          "objectClass",
+          HashSet::from(["inetOrgPerson", "organizationalPerson", "person"]),
+        ),
+        ("uid", HashSet::from(["deep"])),
+        ("cn", HashSet::from(["Deep User"])),
+        ("sn", HashSet::from(["User"])),
+      ],
+    )
+    .expect("add deep user")
+    .success()
+    .expect("deep user success");
+
+  // Also add a normal user directly under ou=users.
+  let alice_dn = format!("uid=alice,ou=users,{}", server.base_dn);
+  ldap
+    .add(
+      &alice_dn,
+      vec![
+        (
+          "objectClass",
+          HashSet::from(["inetOrgPerson", "organizationalPerson", "person"]),
+        ),
+        ("uid", HashSet::from(["alice"])),
+        ("cn", HashSet::from(["Alice Smith"])),
+        ("sn", HashSet::from(["Smith"])),
+      ],
+    )
+    .expect("add alice")
+    .success()
+    .expect("alice success");
+
+  let provider = make_provider();
+  let live = provider
+    .list_live(&make_config(&server), &[])
+    .expect("list_live");
+
+  assert!(
+    live["users"]["alice"].is_object(),
+    "alice should appear in list_live"
+  );
+  assert!(
+    live["users"]["deep"].is_null(),
+    "deep user in sub-OU must not appear in list_live"
+  );
+}
+
+/// Creating a group with multiple members, applying, then planning again with
+/// the same desired state must produce an empty plan.  This validates that
+/// multi-valued attributes like `member` are compared with set equality.
+#[test]
+fn group_with_multiple_members_is_idempotent() {
+  let server = TestLdapServer::start().expect("start slapd");
+  server.initialize().expect("initialize base structure");
+
+  let provider = make_provider();
+  let config = make_config(&server);
+
+  // Desired: two users and a group containing both.
+  let desired_state = desired_with_groups(
+    serde_json::json!({
+      "alice": alice("Alice Smith", managed("secret")),
+      "bob": {
+        "cn": managed("Bob Jones"),
+        "sn": managed("Jones"),
+        "mail": managed("bob@example.org"),
+        "userPassword": managed("secret"),
+      },
+    }),
+    serde_json::json!({
+      "staff": group("Staff group", &["alice", "bob"]),
+    }),
+  );
+
+  // First plan + apply.
+  let live1 = provider.list_live(&config, &[]).expect("list_live 1");
+  let mut plan1 = provider
+    .plan(&desired_state, &live1, &NixHapiMeta::default(), &config)
+    .expect("plan 1");
+  plan1.instance_name = "test".to_string();
+  assert!(!plan1.changes.is_empty(), "First plan should have changes");
+  provider.apply(&plan1, &config).expect("apply 1");
+
+  // Second plan should be empty — no spurious diffs from multi-valued attrs.
+  let live2 = provider.list_live(&config, &[]).expect("list_live 2");
+  let plan2 = provider
+    .plan(&desired_state, &live2, &NixHapiMeta::default(), &config)
+    .expect("plan 2");
+
+  assert!(
+    plan2.changes.is_empty(),
+    "Expected no changes on second plan for group with multiple members; got: {:?}",
+    plan2.changes
+  );
 }

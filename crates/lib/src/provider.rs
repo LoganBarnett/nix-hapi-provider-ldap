@@ -157,26 +157,15 @@ fn query_live_state(
   let users_base = ou_users_dn(&config.base_dn);
   let groups_base = ou_groups_dn(&config.base_dn);
 
-  // Users: one-level search under ou=users.
-  let user_dns = entry_list(ldap, &users_base)?;
-  for dn in user_dns {
-    if dn == users_base {
-      continue; // skip the OU entry itself
-    }
+  for dn in entry_list(ldap, &users_base)? {
     if let Some(attrs) = entry_get(ldap, &dn)? {
-      // Extract uid from the DN (uid=alice,ou=users,...) → "alice".
       if let Some(uid) = rdn_value(&dn, "uid") {
         state.users.insert(uid, attrs);
       }
     }
   }
 
-  // Groups: one-level search under ou=groups.
-  let group_dns = entry_list(ldap, &groups_base)?;
-  for dn in group_dns {
-    if dn == groups_base {
-      continue;
-    }
+  for dn in entry_list(ldap, &groups_base)? {
     if let Some(attrs) = entry_get(ldap, &dn)? {
       if let Some(cn) = rdn_value(&dn, "cn") {
         state.groups.insert(cn, attrs);

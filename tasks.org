@@ -170,3 +170,70 @@ nix develop --command cargo test --workspace
 #+end_src
 
 Both must succeed with no errors.
+
+** DONE Group multi-member reconciliation is broken                :bug:ldap:
+  :PROPERTIES:
+  :ID:       L1
+  :END:
+
+  ~reconcile.rs:133-136~: ~mock_resolved~ joins multi-valued attributes with
+  ~"\n"~ into a single ~ResolvedFieldValue::Managed~.  ~diff_attrs~ then
+  compares one joined string against individual live entries — always differs.
+
+  - Test: create group with ~[alice, bob]~, apply, run plan again with same
+    state, assert plan is empty.
+  - Fix: add ~diff_group_attrs~ that compares ~HashMap<String, Vec<String>>~
+    directly, doing set-equality on multi-valued attributes.
+
+** DONE entry_add swallows rc=68 (already exists)                  :bug:ldap:
+  :PROPERTIES:
+  :ID:       L2
+  :END:
+
+  ~operations.rs:45~: treating "already exists" as success masks real problems.
+  If the reconciler expects an Add but the entry exists with wrong attributes,
+  those attributes are not updated.
+
+  - Test: manually create entry with wrong attributes, apply expecting Add,
+    assert correct attributes after apply.
+  - Fix: on rc=68, fall back to Modify with desired attributes; or remove
+    the swallow and let ~list_live~ detect existing entries.
+
+** DONE entry_list uses Scope::Subtree but callers expect one level :bug:ldap:
+  :PROPERTIES:
+  :ID:       L3
+  :END:
+
+  ~operations.rs:130-132~: ~Scope::Subtree~ returns base DN itself plus all
+  descendants.  Nested OUs return unexpected entries.
+
+  - Test: create entries under ~ou=users~ and a sub-OU, assert ~entry_list~
+    returns only direct children.
+  - Fix: use ~Scope::OneLevel~ for live-state listing.
+
+** DONE LDAP config require_string panics on DerivedFrom           :bug:ldap:
+  :PROPERTIES:
+  :ID:       L4
+  :END:
+
+  ~config.rs:36~: ~rfv.value().unwrap()~ panics if ~ResolvedFieldValue~ is
+  ~DerivedFrom~ since ~value()~ returns ~None~ for that variant.
+
+  - Test: construct ~ResolvedConfig~ with ~DerivedFrom~ for ~url~, assert
+    error not panic.
+  - Fix: handle ~None~ from ~value()~ as ~MissingConfig~ error.
+
+** DONE Multi-valued attribute set comparison                      :bug:ldap:
+  :PROPERTIES:
+  :ID:       L5
+  :END:
+
+  ~reconcile.rs:278-297~: ~diff_attrs~ for ~Managed~ values creates a
+  ~HashSet~ with a single entry, then compares against live set.  Breaks for
+  any multi-valued LDAP attribute (~objectClass~, ~member~).
+
+  Related to L1 but affects user extra fields too.
+
+  - Test: user with multi-valued extra field, assert plan is empty when
+    desired matches live.
+  - Fix: ~diff_attrs~ should handle multi-valued attributes properly.
