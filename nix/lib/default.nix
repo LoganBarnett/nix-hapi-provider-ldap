@@ -1,9 +1,24 @@
 # LDAP-specific helpers for constructing valid nix-hapi desired state.
 # These enforce required fields at Nix eval time — a missing argument is a Nix
-# error.  Field values should be wrapped with nix-hapi's mkManaged/mkInitial
-# etc. by the consumer.
-{
+# error.  Plain string values are auto-wrapped as mkManaged; values already
+# tagged with __nixhapi (e.g. mkInitial, mkManagedFromPath) pass through.
+let
+  # Wraps a plain string as a managed field value.  Already-tagged values
+  # (attrsets with __nixhapi) are returned unchanged.
+  ensureManaged = v:
+    if builtins.isAttrs v && v ? __nixhapi
+    then v
+    else {
+      __nixhapi = "managed";
+      value = v;
+    };
+
+  # Applies ensureManaged to every value in an attrset.
+  ensureManagedAttrs = builtins.mapAttrs (_: ensureManaged);
+in {
   # Constructs a complete LDAP provider scope with config metadata.
+  # Config fields accept plain strings (auto-wrapped as managed) or
+  # pre-tagged values (mkManagedFromPath, mkInitial, etc.).
   mkLdapProvider = {
     url,
     baseDn,
@@ -16,7 +31,10 @@
     __nixhapi =
       {
         type = "ldap";
-        inherit url baseDn bindDn bindPassword;
+        url = ensureManaged url;
+        baseDn = ensureManaged baseDn;
+        bindDn = ensureManaged bindDn;
+        bindPassword = ensureManaged bindPassword;
       }
       // (
         if ignore != []
@@ -26,7 +44,8 @@
     inherit users groups;
   };
 
-  # Validates required inetOrgPerson fields at eval time.
+  # Validates required inetOrgPerson fields at eval time.  Plain strings are
+  # auto-wrapped as managed; use mkInitial/mkManagedFromPath etc. to override.
   mkLdapUser = {
     cn,
     sn,
@@ -45,23 +64,24 @@
       "description"
     ];
   in
-    {inherit cn sn mail userPassword;}
+    ensureManagedAttrs {inherit cn sn mail userPassword;}
     // (
       if loginShell != null
-      then {inherit loginShell;}
+      then ensureManagedAttrs {inherit loginShell;}
       else {}
     )
     // (
       if description != null
-      then {inherit description;}
+      then ensureManagedAttrs {inherit description;}
       else {}
     )
-    // extra;
+    // ensureManagedAttrs extra;
 
   mkLdapGroup = {
     description,
     members ? [],
   }: {
-    inherit description members;
+    description = ensureManaged description;
+    inherit members;
   };
 }
