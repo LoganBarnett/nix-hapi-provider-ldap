@@ -186,12 +186,15 @@ fn rdn_value(dn: &str, attr: &str) -> Option<String> {
 }
 
 fn compile_ignore_patterns(
-  patterns: &[String],
+  patterns: &[nix_hapi_lib::jq_expr::JqExpr],
 ) -> Result<Vec<Regex>, ProviderError> {
   patterns
     .iter()
-    .map(|p| {
-      Regex::new(p).map_err(|e| {
+    .map(|jq| {
+      let p = jq
+        .resolve()
+        .map_err(|e| ProviderError::OperationFailed(e.to_string()))?;
+      Regex::new(&p).map_err(|e| {
         ProviderError::OperationFailed(format!(
           "Invalid ignore pattern {:?}: {}",
           p, e
