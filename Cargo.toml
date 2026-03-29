@@ -33,9 +33,6 @@ thiserror = "2.0"
 # LDAP client
 ldap3 = "0.11"
 
-# Pattern matching for __nixhapi.ignore
-regex = "1"
-
 # Async runtime (required by ldap3)
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 

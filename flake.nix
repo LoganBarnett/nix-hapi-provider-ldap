@@ -71,9 +71,11 @@
       # PATH and that the schema directory is reachable via the standard
       # grandparent-of-binary heuristic in TestLdapServer.
       openldapWithSlapd
-      # Unified formatter
+      # Unified formatter and language-specific formatters
       pkgs.treefmt
       pkgs.alejandra
+      pkgs.elmPackages.elm-format
+      pkgs.nodePackages.prettier
     ];
   in {
     lib = import ./nix/lib/default.nix;

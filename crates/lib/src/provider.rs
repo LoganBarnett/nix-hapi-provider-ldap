@@ -11,7 +11,6 @@ use ldap3::Mod;
 use nix_hapi_lib::meta::NixHapiMeta;
 use nix_hapi_lib::plan::{ApplyReport, ProviderPlan};
 use nix_hapi_lib::provider::{Filter, Provider, ProviderError, ResolvedConfig};
-use regex::Regex;
 use std::collections::HashSet;
 use tracing::info;
 
@@ -57,10 +56,10 @@ impl Provider for LdapProvider {
     let live_state: LdapLiveState = serde_json::from_value(live.clone())
       .map_err(|e| ProviderError::LiveStateParse(e.to_string()))?;
 
-    let ignore_patterns = compile_ignore_patterns(&meta.ignore)?;
+    let ignore_exprs = resolve_ignore_exprs(&meta.ignore)?;
 
     let ldap_diff =
-      diff(&desired_state, &live_state, &ldap_config.base_dn, &ignore_patterns)
+      diff(&desired_state, &live_state, &ldap_config.base_dn, &ignore_exprs)
         .map_err(|e: ReconcileError| {
           ProviderError::OperationFailed(e.to_string())
         })?;
@@ -185,21 +184,14 @@ fn rdn_value(dn: &str, attr: &str) -> Option<String> {
   })
 }
 
-fn compile_ignore_patterns(
-  patterns: &[nix_hapi_lib::jq_expr::JqExpr],
-) -> Result<Vec<Regex>, ProviderError> {
-  patterns
+fn resolve_ignore_exprs(
+  exprs: &[nix_hapi_lib::jq_expr::JqExpr],
+) -> Result<Vec<String>, ProviderError> {
+  exprs
     .iter()
     .map(|jq| {
-      let p = jq
-        .resolve()
-        .map_err(|e| ProviderError::OperationFailed(e.to_string()))?;
-      Regex::new(&p).map_err(|e| {
-        ProviderError::OperationFailed(format!(
-          "Invalid ignore pattern {:?}: {}",
-          p, e
-        ))
-      })
+      jq.resolve()
+        .map_err(|e| ProviderError::OperationFailed(e.to_string()))
     })
     .collect()
 }

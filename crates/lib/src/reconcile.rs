@@ -1,7 +1,9 @@
 use crate::desired_state::{GroupEntry, LdapDesiredState, UserEntry};
 use crate::live_state::LdapLiveState;
+use nix_hapi_lib::dag::eval_jq_first;
 use nix_hapi_lib::field_value::{FieldValueError, ResolvedFieldValue};
 use nix_hapi_lib::plan::{FieldDiff, ResourceChange};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -50,12 +52,16 @@ pub enum AttrModOp {
   Replace,
 }
 
-/// Resolves and diffs `desired` against `live`, applying `ignore` patterns.
+/// Resolves and diffs `desired` against `live`, applying `ignore` expressions.
+///
+/// Each ignore expression is a jq filter evaluated with `.` bound to
+/// `{"key": "<dn>", "resource_id": "<dn>"}`.  A truthy result exempts the
+/// resource from deletion.
 pub fn diff(
   desired: &LdapDesiredState,
   live: &LdapLiveState,
   base_dn: &str,
-  ignore_patterns: &[regex::Regex],
+  ignore_exprs: &[String],
 ) -> Result<LdapDiff, ReconcileError> {
   let mut resource_changes = Vec::new();
   let mut to_add = Vec::new();
@@ -184,7 +190,7 @@ pub fn diff(
         .filter(|cn| !desired_cns.contains(cn.as_str()))
         .map(|cn| group_dn(cn, base_dn)),
     )
-    .filter(|dn| !is_ignored(dn, ignore_patterns))
+    .filter(|dn| !is_ignored(dn, ignore_exprs))
     .collect();
 
   // Delete deepest entries first so parents can be removed after children.
@@ -456,8 +462,25 @@ fn dn_depth(dn: &str) -> usize {
   dn.split(',').count()
 }
 
-fn is_ignored(dn: &str, patterns: &[regex::Regex]) -> bool {
-  patterns.iter().any(|re| re.is_match(dn))
+/// Evaluates ignore expressions against a resource DN.  Each expression
+/// receives `.` as `{"key": "<dn>", "resource_id": "<dn>"}`.  If any
+/// expression produces a truthy result, the resource is ignored.
+fn is_ignored(dn: &str, exprs: &[String]) -> bool {
+  exprs.iter().any(|expr| {
+    let input = json!({"key": dn, "resource_id": dn});
+    match eval_jq_first("(ignore)", expr, input) {
+      Ok(result) => is_truthy(&result),
+      Err(_) => false,
+    }
+  })
+}
+
+fn is_truthy(v: &serde_json::Value) -> bool {
+  match v {
+    serde_json::Value::Null => false,
+    serde_json::Value::Bool(b) => *b,
+    _ => true,
+  }
 }
 
 #[cfg(test)]
