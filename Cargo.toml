@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/provider",
+    "crates/lib",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/nix-hapi-provider-ldap"
+
+[workspace.dependencies]
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# Utilities
+# tap - Enables method chaining and reduces superfluous local variables
+# that only exist to name intermediate results. Prefer .tap() over temporary
+# variables when it improves readability.
+tap = "1.0"
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "2.0"
+
+# LDAP client
+ldap3 = "0.11"
+
+# Pattern matching for __nixhapi.ignore
+regex = "1"
+
+# Async runtime (required by ldap3)
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# Testing
+tempfile = "3"
+
+# nix-hapi Provider trait and host loop
+nix-hapi-lib = { git = "https://github.com/LoganBarnett/nix-hapi" }
+
+# Shared library
+nix-hapi-provider-ldap-lib = { path = "crates/lib" }
+
+# ============================================================================
+# BUILD PROFILES
+# ============================================================================
+# Without these settings, target/debug can easily reach 20-40 GB on
+# non-trivial projects.  Dependencies are the primary culprit.
+#
+# See https://doc.rust-lang.org/cargo/reference/profiles.html
+
+[profile.dev]
+# No debug symbols.  The debugger is rarely used and debug symbols are
+# the single largest contributor to target/ bloat.
+debug = false
+# Disable incremental compilation.  Incremental writes many small files
+# to target/debug/incremental/ that accumulate quickly; the compile-time
+# benefit rarely outweighs the disk cost for typical workflows.
+incremental = false
+
+[profile.dev.package."*"]
+# Optimize dependencies even in dev builds.  Libraries like tokio and
+# axum are bottlenecks when unoptimized; this makes the program run at
+# near-release speed during development with minimal extra compile time
+# on subsequent incremental builds.
+opt-level = 3
+
+[profile.release]
+debug = false

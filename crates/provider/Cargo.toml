@@ -1,0 +1,16 @@
+[package]
+name = "nix-hapi-provider-ldap"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "nix-hapi-provider-ldap"
+path = "src/main.rs"
+
+[dependencies]
+nix-hapi-provider-ldap-lib = { workspace = true }
+nix-hapi-lib = { workspace = true }

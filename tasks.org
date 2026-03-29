@@ -1,0 +1,146 @@
+#+title:     nix-hapi-provider-ldap Tasks
+#+author:    Logan Barnett
+#+language:  en
+
+* Project Overview
+
+A standalone LDAP provider binary for [[https://github.com/LoganBarnett/nix-hapi][nix-hapi]].  The provider implements the
+=Provider= trait from =nix-hapi-lib= and is spawned as a subprocess by the
+nix-hapi reconciler.
+
+Reference implementations to draw from:
+
+- =~/dev/nix-hapi/crates/ldap= — LDAP implementation to port wholesale.
+- =~/dev/nix-hapi/crates/fake= — Fake provider, useful for understanding the
+  minimal Provider trait surface.
+- =~/dev/nix-hapi/crates/ldap/tests/= — Integration tests to port, including
+  the =TestLdapServer= harness that spins up a real =slapd= instance.
+
+The crate is referenced via the nix-hapi GitHub mirror:
+https://github.com/LoganBarnett/nix-hapi
+
+* Tasks
+
+** DONE Generate project from rust-template
+:PROPERTIES:
+:CREATED: 2026-03-28
+:END:
+
+Ran =new-project.sh= with =--name nix-hapi-provider-ldap --crates cli=.  The
+=web= crate was excluded.  Template provenance written to =rust-template.json=.
+
+** DONE Create Gitea remote on gitea.proton
+
+#+begin_src sh
+tea repo create --name nix-hapi-provider-ldap --owner $USER
+git remote add origin ssh://git@gitea.proton:2222/$USER/nix-hapi-provider-ldap.git
+#+end_src
+
+** DONE Prune parts of the template we don't need
+:PROPERTIES:
+:CREATED: 2026-03-28
+:END:
+
+- Renamed =crates/cli= → =crates/provider=; package/binary renamed to
+  =nix-hapi-provider-ldap=.
+- Replaced placeholder =run()= in =main.rs= with
+  =nix_hapi_lib::provider_host::run(LdapProvider)=.
+- Deleted =config.rs= and =logging.rs= from the provider crate (config comes
+  through JSON-RPC; no CLI arg parsing needed).
+- Replaced =crates/lib/src/lib.rs= with a =LdapProvider= placeholder
+  implementing =Provider= via =todo!()=; deleted =crates/lib/src/logging.rs=.
+- Updated workspace =Cargo.toml=: added =nix-hapi-lib= git dep, =ldap3=,
+  =regex=, =tokio=; removed all web/auth/metrics/Elm deps.
+- Updated =flake.nix=: renamed crate entry, stripped Elm toolchain and web
+  NixOS module, added =openldap= to =devPackages=.
+- Deleted =nix/modules/web.nix= and =nix/packages/web.nix=.
+
+** TODO Update workspace metadata
+
+Edit the [[workspace.package]] block in the root =Cargo.toml=:
+
+#+begin_src toml
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["Logan Barnett <logustus@gmail.com>"]
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/LoganBarnett/nix-hapi-provider-ldap"
+#+end_src
+
+Also update =flake.nix= top-level =description= and the =workspaceCrates=
+human-readable descriptions.
+
+** TODO Port LDAP implementation from nix-hapi
+
+The canonical implementation lives at =~/dev/nix-hapi/crates/ldap/src/=.
+Copy and adapt the following modules into =crates/lib/src/= (or a dedicated
+crate):
+
+| Source file         | Purpose                                               |
+|---------------------+-------------------------------------------------------|
+| =config.rs=         | LDAP config struct + validation                       |
+| =connection.rs=     | =ldap3= connection helper                             |
+| =desired_state.rs=  | Deserialised desired-state types                      |
+| =live_state.rs=     | Deserialised live-state types                         |
+| =operations.rs=     | Low-level LDAP add/modify/delete/list/get helpers     |
+| =reconcile.rs=      | Diff engine: desired vs live → list of changes        |
+| =runbook.rs=        | Translate changes into runbook steps                  |
+| =provider.rs=       | =LdapProvider= struct implementing =nix_hapi_lib::provider::Provider= |
+
+Wire =main.rs= to call =nix_hapi_lib::provider_host::run(LdapProvider)=, matching
+the pattern in =~/dev/nix-hapi/crates/ldap/src/main.rs=.
+
+Add required dependencies to =Cargo.toml= (workspace-level and crate-level):
+
+- =nix-hapi-lib= (path or git dep pointing at the GitHub mirror)
+- =ldap3=
+- =regex=
+- =tracing=
+- =tap=
+- =tempfile= (dev-dependency for tests)
+
+** TODO Write integration tests
+
+Port the test suite from =~/dev/nix-hapi/crates/ldap/tests/=.
+
+*** Test harness
+
+Port =tests/common/mod.rs= containing =TestLdapServer=:
+
+- Spawns a real =slapd= process on a unique port (atomic counter for
+  parallelism).
+- Generates a minimal =slapd.conf= in a =tempfile::TempDir=.
+- Locates OpenLDAP schemas via the =slapd= binary path (Nix-store-aware).
+- =initialize()= creates =dc=test,dc=local=, =ou=users=, =ou=groups= OUs.
+- =Drop= kills the process cleanly.
+
+Ensure =slapd= (openldap) is available in =flake.nix= =devPackages=.
+
+*** Test scenarios to port from nix-hapi
+
+| Test name                          | What it verifies                                          |
+|------------------------------------+-----------------------------------------------------------|
+| =canary_list_live_empty=           | Fresh server returns empty users/groups.                  |
+| =plan_produces_add_for_new_user=   | User in desired but absent from live → Add change.        |
+| =apply_creates_user=               | Apply creates the user; next list_live shows it.          |
+| =apply_is_idempotent=              | plan → apply → plan produces empty second plan.           |
+| =managed_field_is_enforced_on_change= | Changed Managed field → Modify in next plan.           |
+| =initial_field_not_updated_when_present= | Initial field not re-applied once present.        |
+| =user_absent_from_desired_is_deleted= | User removed from desired → Delete change.             |
+| =ignore_pattern_prevents_deletion= | Ignore pattern exempts live resource from deletion.       |
+| =runbook_scrubs_bind_password=     | Runbook commands never expose the bind password.          |
+
+*** Additional tests to consider
+
+- Group create/modify/delete coverage (ported tests only cover users).
+- Cross-provider dependency ordering (not needed here but document as future).
+
+** TODO Verify build and tests pass
+
+#+begin_src sh
+nix develop --command cargo build --workspace
+nix develop --command cargo test --workspace
+#+end_src
+
+Both must succeed with no errors.
