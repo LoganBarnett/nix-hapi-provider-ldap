@@ -76,6 +76,8 @@
       pkgs.alejandra
     ];
   in {
+    lib = import ./nix/lib/default.nix;
+
     devShells = forAllSystems (system: let
       pkgs = pkgsFor system;
     in {
