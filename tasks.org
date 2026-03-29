@@ -106,7 +106,20 @@ Add required dependencies to =Cargo.toml= (workspace-level and crate-level):
 - =tap=
 - =tempfile= (dev-dependency for tests)
 
-** TODO Write integration tests
+** DONE Write integration tests
+:PROPERTIES:
+:CREATED: 2026-03-28
+:END:
+
+Ported =tests/common/mod.rs= (=TestLdapServer= harness) and all 9 scenarios
+from =~/dev/nix-hapi/crates/ldap/tests/= into =crates/provider/tests/=.  Tests
+live in the provider crate so that =CARGO_BIN_EXE_nix-hapi-provider-ldap= is
+available.
+
+Added =openldapWithSlapd= wrapper in =flake.nix= (=symlinkJoin= that adds
+=bin/slapd=) because on this platform slapd lives in =libexec/=.  The
+grandparent-of-binary heuristic in =find_schema_dir()= still resolves to the
+correct =etc/schema/= path via the joined symlink tree.
 
 Port the test suite from =~/dev/nix-hapi/crates/ldap/tests/=.
 
@@ -142,7 +155,14 @@ Ensure =slapd= (openldap) is available in =flake.nix= =devPackages=.
 - Group create/modify/delete coverage (ported tests only cover users).
 - Cross-provider dependency ordering (not needed here but document as future).
 
-** TODO Verify build and tests pass
+** DONE Verify build and tests pass
+:PROPERTIES:
+:CREATED: 2026-03-28
+:END:
+
+=cargo build --workspace= and =cargo test --workspace= both pass:
+- 9 integration tests (all LDAP scenarios via slapd subprocess)
+- 2 unit tests (=reconcile= DerivedFrom diff logic)
 
 #+begin_src sh
 nix develop --command cargo build --workspace

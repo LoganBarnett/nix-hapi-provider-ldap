@@ -49,14 +49,28 @@
           "rustfmt"
         ];
       };
+      # On some platforms slapd lives in libexec rather than bin.
+      # symlinkJoin mirrors the full openldap tree and adds a bin/slapd
+      # symlink so that `which slapd` returns a path whose grandparent is
+      # the package root, which is what TestLdapServer.find_schema_dir()
+      # expects when locating etc/schema/.
+      openldapWithSlapd = pkgs.symlinkJoin {
+        name = "openldap-with-slapd-in-bin";
+        paths = [pkgs.openldap];
+        postBuild = ''
+          ln -sf ${pkgs.openldap}/libexec/slapd $out/bin/slapd
+        '';
+      };
     in [
       rust
       pkgs.cargo-sweep
       pkgs.pkg-config
       pkgs.openssl
       pkgs.jq
-      # OpenLDAP for integration tests (provides slapd).
-      pkgs.openldap
+      # OpenLDAP for integration tests; openldapWithSlapd ensures slapd is on
+      # PATH and that the schema directory is reachable via the standard
+      # grandparent-of-binary heuristic in TestLdapServer.
+      openldapWithSlapd
       # Unified formatter
       pkgs.treefmt
       pkgs.alejandra

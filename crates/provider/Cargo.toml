@@ -14,3 +14,8 @@ path = "src/main.rs"
 [dependencies]
 nix-hapi-provider-ldap-lib = { workspace = true }
 nix-hapi-lib = { workspace = true }
+
+[dev-dependencies]
+ldap3 = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
