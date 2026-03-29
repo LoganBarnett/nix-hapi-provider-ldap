@@ -30,11 +30,13 @@ in {
   }: {
     __nixhapi =
       {
-        type = "ldap";
-        url = ensureManaged url;
-        baseDn = ensureManaged baseDn;
-        bindDn = ensureManaged bindDn;
-        bindPassword = ensureManaged bindPassword;
+        provider = {
+          type = "ldap";
+          url = ensureManaged url;
+          baseDn = ensureManaged baseDn;
+          bindDn = ensureManaged bindDn;
+          bindPassword = ensureManaged bindPassword;
+        };
       }
       // (
         if ignore != []
