@@ -74,7 +74,10 @@ repository  = "https://github.com/LoganBarnett/nix-hapi-provider-ldap"
 Also update =flake.nix= top-level =description= and the =workspaceCrates=
 human-readable descriptions.
 
-** TODO Port LDAP implementation from nix-hapi
+** DONE Port LDAP implementation from nix-hapi
+:PROPERTIES:
+:CREATED: 2026-03-28
+:END:
 
 The canonical implementation lives at =~/dev/nix-hapi/crates/ldap/src/=.
 Copy and adapt the following modules into =crates/lib/src/= (or a dedicated
