@@ -25,7 +25,7 @@ struct ResolvedUser {
 
 /// A resolved group entry ready for comparison against live state.
 struct ResolvedGroup {
-  pub description: ResolvedFieldValue,
+  pub description: Option<ResolvedFieldValue>,
   pub members: Vec<String>,
 }
 
@@ -258,13 +258,18 @@ fn resolve_group(
   cn: &str,
   group: &GroupEntry,
 ) -> Result<ResolvedGroup, ReconcileError> {
-  let description = group.description.resolve().map_err(|source| {
-    ReconcileError::FieldResolution {
-      entry: cn.to_string(),
-      field: "description".to_string(),
-      source,
-    }
-  })?;
+  let description = group
+    .description
+    .as_ref()
+    .map(|fv| {
+      fv.resolve()
+        .map_err(|source| ReconcileError::FieldResolution {
+          entry: cn.to_string(),
+          field: "description".to_string(),
+          source,
+        })
+    })
+    .transpose()?;
 
   Ok(ResolvedGroup {
     description,
@@ -424,7 +429,7 @@ fn group_to_attr_map(
   );
   attrs.insert("cn".to_string(), vec![cn.to_string()]);
 
-  if let Some(desc) = group.description.value() {
+  if let Some(desc) = group.description.as_ref().and_then(|rfv| rfv.value()) {
     attrs.insert("description".to_string(), vec![desc.to_string()]);
   }
 

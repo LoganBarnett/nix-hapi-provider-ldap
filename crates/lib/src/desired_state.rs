@@ -37,7 +37,8 @@ pub struct UserEntry {
 /// A desired LDAP group entry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GroupEntry {
-  pub description: FieldValue,
+  #[serde(default)]
+  pub description: Option<FieldValue>,
 
   /// Usernames (uid values) of group members.  The provider constructs
   /// the full member DNs from these values and the configured `base_dn`.

@@ -80,10 +80,13 @@ in {
     // ensureManagedAttrs extra;
 
   mkLdapGroup = {
-    description,
+    description ? null,
     members ? [],
-  }: {
-    description = ensureManaged description;
-    inherit members;
-  };
+  }:
+    (
+      if description != null
+      then {description = ensureManaged description;}
+      else {}
+    )
+    // {inherit members;};
 }
