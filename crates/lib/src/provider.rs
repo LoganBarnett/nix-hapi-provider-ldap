@@ -7,7 +7,8 @@ use crate::operations::{
 };
 use crate::reconcile::{diff, ou_groups_dn, ou_users_dn, ReconcileError};
 use crate::runbook::{to_runbook_steps, LdapOperation};
-use ldap3::Mod;
+use async_trait::async_trait;
+use ldap3::{Ldap, Mod};
 use nix_hapi_lib::meta::NixHapiMeta;
 use nix_hapi_lib::plan::{ApplyReport, ProviderPlan};
 use nix_hapi_lib::provider::{Filter, Provider, ProviderError, ResolvedConfig};
@@ -16,6 +17,7 @@ use tracing::info;
 
 pub struct LdapProvider;
 
+#[async_trait]
 impl Provider for LdapProvider {
   fn provider_type(&self) -> &str {
     "ldap"
@@ -25,22 +27,23 @@ impl Provider for LdapProvider {
     &["bindPassword"]
   }
 
-  fn list_live(
+  async fn list_live(
     &self,
     config: &ResolvedConfig,
     _filters: &[Filter],
   ) -> Result<serde_json::Value, ProviderError> {
     let ldap_config = ResolvedLdapConfig::from_resolved_config(config)?;
-    let mut ldap = connect(&ldap_config)?;
+    let mut ldap = connect(&ldap_config).await?;
 
     let live = query_live_state(&mut ldap, &ldap_config)
+      .await
       .map_err(|e| ProviderError::OperationFailed(e.to_string()))?;
 
     serde_json::to_value(&live)
       .map_err(|e| ProviderError::LiveStateParse(e.to_string()))
   }
 
-  fn plan(
+  async fn plan(
     &self,
     desired: &serde_json::Value,
     live: &serde_json::Value,
@@ -67,20 +70,20 @@ impl Provider for LdapProvider {
     let runbook = to_runbook_steps(&ldap_diff, &ldap_config);
 
     Ok(ProviderPlan {
-      instance_name: String::new(), // filled in by the CLI dispatcher
+      instance_name: String::new(),
       provider_type: self.provider_type().to_string(),
       changes: ldap_diff.resource_changes,
       runbook,
     })
   }
 
-  fn apply(
+  async fn apply(
     &self,
     plan: &ProviderPlan,
     config: &ResolvedConfig,
   ) -> Result<ApplyReport, ProviderError> {
     let ldap_config = ResolvedLdapConfig::from_resolved_config(config)?;
-    let mut ldap = connect(&ldap_config)?;
+    let mut ldap = connect(&ldap_config).await?;
     let mut report = ApplyReport::default();
 
     for step in &plan.runbook {
@@ -103,7 +106,7 @@ impl Provider for LdapProvider {
             .iter()
             .map(|(k, v)| (k.as_str(), v.iter().map(|s| s.as_str()).collect()))
             .collect();
-          entry_add(&mut ldap, &dn, borrowed).map_err(op_err)?;
+          entry_add(&mut ldap, &dn, borrowed).await.map_err(op_err)?;
           report.created.push(dn);
         }
         LdapOperation::Modify { dn, changes } => {
@@ -131,12 +134,12 @@ impl Provider for LdapProvider {
               }
             })
             .collect();
-          entry_modify(&mut ldap, &dn, mods).map_err(op_err)?;
+          entry_modify(&mut ldap, &dn, mods).await.map_err(op_err)?;
           report.modified.push(dn);
         }
         LdapOperation::Delete { dn } => {
           info!(dn = %dn, "Deleting entry");
-          entry_delete(&mut ldap, &dn).map_err(op_err)?;
+          entry_delete(&mut ldap, &dn).await.map_err(op_err)?;
           report.deleted.push(dn);
         }
       }
@@ -147,8 +150,8 @@ impl Provider for LdapProvider {
 }
 
 /// Queries the live LDAP state for users and groups.
-fn query_live_state(
-  ldap: &mut ldap3::LdapConn,
+async fn query_live_state(
+  ldap: &mut Ldap,
   config: &ResolvedLdapConfig,
 ) -> Result<LdapLiveState, OperationError> {
   let mut state = LdapLiveState::default();
@@ -156,16 +159,16 @@ fn query_live_state(
   let users_base = ou_users_dn(&config.base_dn);
   let groups_base = ou_groups_dn(&config.base_dn);
 
-  for dn in entry_list(ldap, &users_base)? {
-    if let Some(attrs) = entry_get(ldap, &dn)? {
+  for dn in entry_list(ldap, &users_base).await? {
+    if let Some(attrs) = entry_get(ldap, &dn).await? {
       if let Some(uid) = rdn_value(&dn, "uid") {
         state.users.insert(uid, attrs);
       }
     }
   }
 
-  for dn in entry_list(ldap, &groups_base)? {
-    if let Some(attrs) = entry_get(ldap, &dn)? {
+  for dn in entry_list(ldap, &groups_base).await? {
+    if let Some(attrs) = entry_get(ldap, &dn).await? {
       if let Some(cn) = rdn_value(&dn, "cn") {
         state.groups.insert(cn, attrs);
       }
@@ -176,7 +179,8 @@ fn query_live_state(
 }
 
 /// Extracts the value of a named RDN component from a DN string.
-/// e.g. `rdn_value("uid=alice,ou=users,dc=proton,dc=org", "uid")` → `Some("alice")`.
+/// e.g. `rdn_value("uid=alice,ou=users,dc=proton,dc=org", "uid")`
+/// returns `Some("alice")`.
 fn rdn_value(dn: &str, attr: &str) -> Option<String> {
   dn.split(',').next().and_then(|rdn| {
     let (k, v) = rdn.split_once('=')?;

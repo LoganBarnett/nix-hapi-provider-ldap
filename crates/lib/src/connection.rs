@@ -1,18 +1,27 @@
 use crate::config::ResolvedLdapConfig;
-use ldap3::{LdapConn, LdapError};
+use ldap3::{Ldap, LdapConnAsync, LdapError};
 use nix_hapi_lib::provider::ProviderError;
 
-/// Opens and authenticates an LDAP connection from resolved configuration.
-pub fn connect(config: &ResolvedLdapConfig) -> Result<LdapConn, ProviderError> {
-  let mut ldap = LdapConn::new(&config.url).map_err(|e| {
-    ProviderError::ConnectionFailed(format!(
-      "Failed to connect to {} (is the server reachable?): {}",
-      config.url, e
-    ))
-  })?;
+/// Opens and authenticates an async LDAP connection from resolved
+/// configuration.  Spawns a background task to drive the connection.
+pub async fn connect(
+  config: &ResolvedLdapConfig,
+) -> Result<Ldap, ProviderError> {
+  let (conn, mut ldap) =
+    LdapConnAsync::new(&config.url).await.map_err(|e| {
+      ProviderError::ConnectionFailed(format!(
+        "Failed to connect to {} (is the server reachable?): {}",
+        config.url, e
+      ))
+    })?;
+  // The connection driver must run in a background task.
+  tokio::spawn(async move {
+    let _ = conn.drive().await;
+  });
 
   ldap
     .simple_bind(&config.bind_dn, &config.bind_password)
+    .await
     .map_err(|e| {
       ProviderError::ConnectionFailed(format!(
         "Failed to bind as {} to {}: {}",
