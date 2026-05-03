@@ -29,11 +29,10 @@ https://github.com/LoganBarnett/nix-hapi
 Ran =new-project.sh= with =--name nix-hapi-provider-ldap --crates cli=.  The
 =web= crate was excluded.  Template provenance written to =rust-template.json=.
 
-** DONE Create Gitea remote on gitea.proton
+** DONE Wire up the git remote
 
 #+begin_src sh
-tea repo create --name nix-hapi-provider-ldap --owner $USER
-git remote add origin ssh://git@gitea.proton:2222/$USER/nix-hapi-provider-ldap.git
+git remote add origin git@github.com:LoganBarnett/nix-hapi-provider-ldap.git
 #+end_src
 
 ** DONE Prune parts of the template we don't need
