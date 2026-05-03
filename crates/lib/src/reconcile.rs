@@ -277,6 +277,60 @@ fn resolve_group(
   })
 }
 
+/// Lowers a JSON value to the LDAP attribute-value list representation.
+///
+/// LDAP attributes are inherently multi-valued (`Vec<String>` per attribute);
+/// this helper bridges from the engine's `serde_json::Value` field-value
+/// type to that representation, supporting:
+///
+///   * `Value::String("foo")`           → `vec!["foo"]`
+///   * `Value::Array(["a","b","c"])`    → `vec!["a","b","c"]`  (multi-valued)
+///   * `Value::Array([])`               → `vec![]`             (clear attribute)
+///   * `Value::Number(42)`              → `vec!["42"]`         (stringified)
+///   * `Value::Bool(true)`              → `vec!["true"]`       (stringified)
+///   * `Value::Null`                    → `vec![]`             (clear attribute)
+///
+/// Non-scalar elements inside an array (nested arrays, objects, null) are
+/// dropped with a warning rather than failing the whole reconciliation;
+/// such values don't have a well-defined LDAP representation.  Top-level
+/// objects are treated the same way.
+fn value_to_attr_values(attr: &str, value: &serde_json::Value) -> Vec<String> {
+  fn scalar_to_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+      serde_json::Value::String(s) => Some(s.clone()),
+      serde_json::Value::Number(n) => Some(n.to_string()),
+      serde_json::Value::Bool(b) => Some(b.to_string()),
+      _ => None,
+    }
+  }
+
+  match value {
+    serde_json::Value::Array(arr) => arr
+      .iter()
+      .filter_map(|v| {
+        scalar_to_string(v).or_else(|| {
+          tracing::warn!(
+            attribute = attr,
+            element = %v,
+            "Skipping non-scalar element in multi-valued LDAP attribute",
+          );
+          None
+        })
+      })
+      .collect(),
+    serde_json::Value::Null => Vec::new(),
+    serde_json::Value::Object(_) => {
+      tracing::warn!(
+        attribute = attr,
+        "Skipping object-valued LDAP attribute; only strings, numbers, \
+         booleans, and arrays of those are supported",
+      );
+      Vec::new()
+    }
+    other => scalar_to_string(other).map(|s| vec![s]).unwrap_or_default(),
+  }
+}
+
 /// Computes attribute modifications needed to bring `live_entry` in line with
 /// `resolved`.  Unmanaged fields are skipped.  Initial fields are skipped when
 /// the attribute already exists in the live entry.
@@ -293,26 +347,23 @@ fn diff_attrs(
         if live_entry.contains_key(attr) {
           continue;
         }
-        // TODO(multi-value): handle Value::Array as a multi-valued
-        // attribute.  For now, only string-typed Managed/Initial values
-        // are supported; non-string values are silently skipped.
-        let Some(value_str) = value.as_str() else {
+        let values = value_to_attr_values(attr, value);
+        if values.is_empty() {
           continue;
-        };
+        }
         mods.push(AttrMod {
           attr: attr.clone(),
           op: AttrModOp::Add,
-          values: vec![value_str.to_string()],
+          values,
         });
       }
       ResolvedFieldValue::Managed(value) => {
-        let Some(value_str) = value.as_str() else {
-          continue;
-        };
+        let values = value_to_attr_values(attr, value);
         let live_vals = live_entry.get(attr);
-        let desired_set: HashSet<&str> = std::iter::once(value_str).collect();
+        let desired_set: HashSet<&str> =
+          values.iter().map(String::as_str).collect();
         let live_set: HashSet<&str> = live_vals
-          .map(|v| v.iter().map(|s| s.as_str()).collect())
+          .map(|v| v.iter().map(String::as_str).collect())
           .unwrap_or_default();
 
         if desired_set != live_set {
@@ -324,7 +375,7 @@ fn diff_attrs(
           mods.push(AttrMod {
             attr: attr.clone(),
             op,
-            values: vec![value_str.to_string()],
+            values,
           });
         }
       }
@@ -391,7 +442,14 @@ fn resolved_to_attr_map(
       ResolvedFieldValue::DerivedFrom { inputs } => {
         Some((k.clone(), vec![format_derived_display(inputs)]))
       }
-      _ => rfv.as_str().map(|v| (k.clone(), vec![v.to_string()])),
+      _ => rfv.value().and_then(|v| {
+        let values = value_to_attr_values(k, v);
+        if values.is_empty() {
+          None
+        } else {
+          Some((k.clone(), values))
+        }
+      }),
     })
     .collect()
 }
@@ -500,6 +558,68 @@ fn is_truthy(v: &serde_json::Value) -> bool {
 mod tests {
   use super::*;
   use nix_hapi_lib::field_value::FieldValue;
+
+  #[test]
+  fn value_to_attr_values_strings_become_singleton_vec() {
+    assert_eq!(
+      value_to_attr_values("cn", &serde_json::json!("Alice")),
+      vec!["Alice".to_string()],
+    );
+  }
+
+  #[test]
+  fn value_to_attr_values_arrays_become_multi_value() {
+    assert_eq!(
+      value_to_attr_values(
+        "objectClass",
+        &serde_json::json!(["top", "person", "inetOrgPerson"]),
+      ),
+      vec![
+        "top".to_string(),
+        "person".to_string(),
+        "inetOrgPerson".to_string(),
+      ],
+    );
+  }
+
+  #[test]
+  fn value_to_attr_values_arrays_stringify_scalars() {
+    assert_eq!(
+      value_to_attr_values("uidNumber", &serde_json::json!([1001, true])),
+      vec!["1001".to_string(), "true".to_string()],
+    );
+  }
+
+  #[test]
+  fn value_to_attr_values_arrays_skip_non_scalar_elements() {
+    assert_eq!(
+      value_to_attr_values(
+        "objectClass",
+        &serde_json::json!(["a", {"nested": "object"}, "b"]),
+      ),
+      vec!["a".to_string(), "b".to_string()],
+    );
+  }
+
+  #[test]
+  fn value_to_attr_values_empty_array_yields_empty_vec() {
+    assert!(
+      value_to_attr_values("memberOf", &serde_json::json!([])).is_empty(),
+    );
+  }
+
+  #[test]
+  fn value_to_attr_values_null_yields_empty_vec() {
+    assert!(
+      value_to_attr_values("description", &serde_json::Value::Null).is_empty(),
+    );
+  }
+
+  #[test]
+  fn value_to_attr_values_object_skipped_with_warning() {
+    assert!(value_to_attr_values("weird", &serde_json::json!({"foo": "bar"}),)
+      .is_empty());
+  }
 
   fn empty_live() -> LdapLiveState {
     LdapLiveState::default()
