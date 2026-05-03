@@ -639,7 +639,7 @@ dependencies = [
 [[package]]
 name = "nix-hapi-lib"
 version = "0.1.0"
-source = "git+https://github.com/LoganBarnett/nix-hapi#5e992dc228d3c16e4ccfe4270fe2fe8bbde8970a"
+source = "git+https://github.com/LoganBarnett/nix-hapi#befc7eb5777deb041a7f3c7908f0d9b81845bc51"
 dependencies = [
  "async-trait",
  "jaq-core",

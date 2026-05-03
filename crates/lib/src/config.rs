@@ -45,13 +45,13 @@ fn require_string(
     Some(rfv) if rfv.is_unmanaged() => Err(ProviderError::UnmanagedConfig {
       field: field.to_string(),
     }),
-    Some(rfv) => rfv
-      .value()
-      .map(|v| v.to_string())
-      .ok_or_else(|| ProviderError::OperationFailed(format!(
-        "Config field {:?} cannot be DerivedFrom; provider configuration requires a concrete value",
+    Some(rfv) => rfv.as_str().map(String::from).ok_or_else(|| {
+      ProviderError::OperationFailed(format!(
+        "Config field {:?} must be a string-valued Managed/Initial; \
+         non-string and DerivedFrom values are not supported here",
         field,
-      ))),
+      ))
+    }),
   }
 }
 
@@ -66,19 +66,21 @@ mod tests {
     let mut config: ResolvedConfig = HashMap::new();
     config.insert(
       "url".to_string(),
-      ResolvedFieldValue::Managed("garbage".to_string()),
+      ResolvedFieldValue::Managed(serde_json::Value::from("garbage")),
     );
     config.insert(
       "baseDn".to_string(),
-      ResolvedFieldValue::Managed("dc=test,dc=local".to_string()),
+      ResolvedFieldValue::Managed(serde_json::Value::from("dc=test,dc=local")),
     );
     config.insert(
       "bindDn".to_string(),
-      ResolvedFieldValue::Managed("cn=admin,dc=test,dc=local".to_string()),
+      ResolvedFieldValue::Managed(serde_json::Value::from(
+        "cn=admin,dc=test,dc=local",
+      )),
     );
     config.insert(
       "bindPassword".to_string(),
-      ResolvedFieldValue::Managed("secret".to_string()),
+      ResolvedFieldValue::Managed(serde_json::Value::from("secret")),
     );
 
     let result = ResolvedLdapConfig::from_resolved_config(&config);
@@ -104,15 +106,17 @@ mod tests {
     );
     config.insert(
       "baseDn".to_string(),
-      ResolvedFieldValue::Managed("dc=test,dc=local".to_string()),
+      ResolvedFieldValue::Managed(serde_json::Value::from("dc=test,dc=local")),
     );
     config.insert(
       "bindDn".to_string(),
-      ResolvedFieldValue::Managed("cn=admin,dc=test,dc=local".to_string()),
+      ResolvedFieldValue::Managed(serde_json::Value::from(
+        "cn=admin,dc=test,dc=local",
+      )),
     );
     config.insert(
       "bindPassword".to_string(),
-      ResolvedFieldValue::Managed("secret".to_string()),
+      ResolvedFieldValue::Managed(serde_json::Value::from("secret")),
     );
 
     let result = ResolvedLdapConfig::from_resolved_config(&config);

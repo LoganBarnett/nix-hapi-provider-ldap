@@ -293,16 +293,24 @@ fn diff_attrs(
         if live_entry.contains_key(attr) {
           continue;
         }
+        // TODO(multi-value): handle Value::Array as a multi-valued
+        // attribute.  For now, only string-typed Managed/Initial values
+        // are supported; non-string values are silently skipped.
+        let Some(value_str) = value.as_str() else {
+          continue;
+        };
         mods.push(AttrMod {
           attr: attr.clone(),
           op: AttrModOp::Add,
-          values: vec![value.clone()],
+          values: vec![value_str.to_string()],
         });
       }
       ResolvedFieldValue::Managed(value) => {
+        let Some(value_str) = value.as_str() else {
+          continue;
+        };
         let live_vals = live_entry.get(attr);
-        let desired_set: HashSet<&str> =
-          std::iter::once(value.as_str()).collect();
+        let desired_set: HashSet<&str> = std::iter::once(value_str).collect();
         let live_set: HashSet<&str> = live_vals
           .map(|v| v.iter().map(|s| s.as_str()).collect())
           .unwrap_or_default();
@@ -316,7 +324,7 @@ fn diff_attrs(
           mods.push(AttrMod {
             attr: attr.clone(),
             op,
-            values: vec![value.clone()],
+            values: vec![value_str.to_string()],
           });
         }
       }
@@ -383,7 +391,7 @@ fn resolved_to_attr_map(
       ResolvedFieldValue::DerivedFrom { inputs } => {
         Some((k.clone(), vec![format_derived_display(inputs)]))
       }
-      _ => rfv.value().map(|v| (k.clone(), vec![v.to_string()])),
+      _ => rfv.as_str().map(|v| (k.clone(), vec![v.to_string()])),
     })
     .collect()
 }
@@ -429,7 +437,7 @@ fn group_to_attr_map(
   );
   attrs.insert("cn".to_string(), vec![cn.to_string()]);
 
-  if let Some(desc) = group.description.as_ref().and_then(|rfv| rfv.value()) {
+  if let Some(desc) = group.description.as_ref().and_then(|rfv| rfv.as_str()) {
     attrs.insert("description".to_string(), vec![desc.to_string()]);
   }
 
@@ -501,7 +509,7 @@ mod tests {
     UserEntry {
       cn,
       sn: FieldValue::Managed {
-        value: "Test".to_string(),
+        value: serde_json::Value::from("Test"),
       },
       mail,
       user_password: pw,
@@ -523,10 +531,10 @@ mod tests {
         expression: "mkManaged(.uid)".to_string(),
       },
       FieldValue::Managed {
-        value: "alice@example.com".to_string(),
+        value: serde_json::Value::from("alice@example.com"),
       },
       FieldValue::Managed {
-        value: "secret".to_string(),
+        value: serde_json::Value::from("secret"),
       },
     );
 
@@ -575,10 +583,10 @@ mod tests {
         expression: "mkManaged(.uid)".to_string(),
       },
       FieldValue::Managed {
-        value: "alice@example.com".to_string(),
+        value: serde_json::Value::from("alice@example.com"),
       },
       FieldValue::Managed {
-        value: "secret".to_string(),
+        value: serde_json::Value::from("secret"),
       },
     );
 
