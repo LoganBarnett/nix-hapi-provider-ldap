@@ -162,15 +162,30 @@
   # Translate one typed scope into the JSON shape the rust reconciler
   # expects today: provider config and ignore list tunneled under
   # `__nixhapi`, users and groups at the top level.
-  scopeToTree = scope: {
-    __nixhapi = {
-      provider = {
-        type = "ldap";
-        inherit (scope.provider) url baseDn bindDn bindPassword;
-      };
-      ignore = scope.ignore;
-    };
-    inherit (scope) users groups;
+  #
+  # Wire-format details we preserve to avoid rust-side changes:
+  #   * `ignore` is omitted entirely when empty (matches the historical
+  #     mkLdapProvider conditional emission).
+  #   * Per-user / per-group null-valued attributes (loginShell,
+  #     description) are stripped, matching the historical conditional
+  #     emission rather than emitting explicit nulls.
+  filterNulls = lib.filterAttrs (_: v: v != null);
+  userToJson = filterNulls;
+  groupToJson = filterNulls;
+
+  scopeToTree = scope: let
+    meta =
+      {
+        provider = {
+          type = "ldap";
+          inherit (scope.provider) url baseDn bindDn bindPassword;
+        };
+      }
+      // (lib.optionalAttrs (scope.ignore != []) {inherit (scope) ignore;});
+  in {
+    __nixhapi = meta;
+    users = lib.mapAttrs (_: userToJson) scope.users;
+    groups = lib.mapAttrs (_: groupToJson) scope.groups;
   };
 in {
   options.services.nix-hapi-ldap = {
