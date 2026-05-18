@@ -7,7 +7,10 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
     crane.url = "github:ipetkov/crane";
     nix-hapi = {
-      url = "github:LoganBarnett/nix-hapi";
+      # GitHub's archive endpoint sometimes 404s for commits while the
+      # ref is reachable via git fetch; using the git+https URL form
+      # avoids that path entirely and follows main natively.
+      url = "git+https://github.com/LoganBarnett/nix-hapi";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

@@ -109,49 +109,27 @@ pub async fn entry_delete(
   }
 }
 
-/// Returns the attribute map for an entry, or `None` if it does not exist.
-pub async fn entry_get(
-  ldap: &mut Ldap,
-  dn: &str,
-) -> Result<Option<HashMap<String, Vec<String>>>, OperationError> {
-  match ldap
-    .search(dn, ldap3::Scope::Base, "(objectClass=*)", vec!["*"])
-    .await
-  {
-    Ok(result) => match result.success() {
-      Ok((entries, _)) => Ok(
-        entries
-          .into_iter()
-          .next()
-          .map(|raw| SearchEntry::construct(raw).attrs),
-      ),
-      Err(LdapError::LdapResult { result: ref r }) if r.rc == 32 => Ok(None),
-      Err(e) => Err(OperationError::SearchFailed {
-        base: dn.to_string(),
-        source: e,
-      }),
-    },
-    Err(e) => Err(OperationError::SearchFailed {
-      base: dn.to_string(),
-      source: e,
-    }),
-  }
-}
-
-/// Lists direct-child DNs under `base_dn` (one-level search).
-pub async fn entry_list(
+/// Lists direct-child entries under `base_dn` with their full
+/// attribute maps in a single LDAP round trip.  Returns `(dn, attrs)`
+/// pairs.  "No such object" (rc=32) on the base is reported as an
+/// empty list so callers can treat a missing OU the same as an empty
+/// OU.
+pub async fn list_entries(
   ldap: &mut Ldap,
   base_dn: &str,
-) -> Result<Vec<String>, OperationError> {
+) -> Result<Vec<(String, HashMap<String, Vec<String>>)>, OperationError> {
   match ldap
-    .search(base_dn, ldap3::Scope::OneLevel, "(objectClass=*)", vec!["1.1"])
+    .search(base_dn, ldap3::Scope::OneLevel, "(objectClass=*)", vec!["*"])
     .await
   {
     Ok(result) => match result.success() {
       Ok((entries, _)) => Ok(
         entries
           .into_iter()
-          .map(|raw| SearchEntry::construct(raw).dn)
+          .map(|raw| {
+            let entry = SearchEntry::construct(raw);
+            (entry.dn, entry.attrs)
+          })
           .collect(),
       ),
       Err(LdapError::LdapResult { result: ref r }) if r.rc == 32 => {

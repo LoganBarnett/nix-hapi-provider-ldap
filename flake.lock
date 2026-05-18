@@ -39,17 +39,17 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1776141758,
-        "narHash": "sha256-+vkoG7GOpUfTm4jrVb3/dJcI8peqAt/fyWY480tim1s=",
-        "owner": "LoganBarnett",
-        "repo": "nix-hapi",
-        "rev": "df043b5cd3e91d423b9687d9f6bfede8be701567",
-        "type": "github"
+        "lastModified": 1779125451,
+        "narHash": "sha256-fc9U5aFLwJXK5vHGzjaAehaMezecPn+ugHacc/j6n/k=",
+        "ref": "refs/heads/main",
+        "rev": "7b4bfb24c3116bfd6e5407e0bce14594282d8048",
+        "revCount": 51,
+        "type": "git",
+        "url": "https://github.com/LoganBarnett/nix-hapi"
       },
       "original": {
-        "owner": "LoganBarnett",
-        "repo": "nix-hapi",
-        "type": "github"
+        "type": "git",
+        "url": "https://github.com/LoganBarnett/nix-hapi"
       }
     },
     "nixpkgs": {

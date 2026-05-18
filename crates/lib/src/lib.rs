@@ -1,9 +1,8 @@
 mod config;
 mod connection;
-mod desired_state;
-mod live_state;
+mod dn;
+mod live;
 mod operations;
-mod reconcile;
 mod runbook;
 
 pub mod provider;

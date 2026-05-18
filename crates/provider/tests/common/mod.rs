@@ -3,7 +3,6 @@
 use std::collections::HashSet;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::thread;
 use std::time::Duration;
 
 /// Monotonically increasing port counter so parallel tests don't collide.
@@ -22,7 +21,11 @@ pub struct TestLdapServer {
 
 impl TestLdapServer {
   /// Spawns a slapd instance and waits until it accepts connections.
-  pub fn start() -> Result<Self, Box<dyn std::error::Error>> {
+  /// Async because the readiness probe uses async ldap3 — we are
+  /// already inside a tokio runtime when called from a `#[tokio::test]`,
+  /// so the sync `LdapConn::new` wrapper would error with
+  /// "cannot start a runtime within a runtime".
+  pub async fn start() -> Result<Self, Box<dyn std::error::Error>> {
     let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
     let url = format!("ldap://localhost:{}", port);
     let base_dn = "dc=test,dc=local".to_string();
@@ -33,13 +36,18 @@ impl TestLdapServer {
     let slapd_conf =
       Self::create_slapd_config(&base_dn, &bind_dn, &bind_password, &data_dir)?;
 
-    let process = Command::new("slapd")
-      .arg("-h")
-      .arg(&url)
-      .arg("-f")
-      .arg(&slapd_conf)
-      .arg("-d")
-      .arg("0") // daemon mode, no debug output
+    // macOS's default RLIMIT_NOFILE is "unlimited", which slapd 2.6.9
+    // reads as dtblsize=-1 and then aborts trying to calloc a 2^64-1
+    // byte fd table.  Wrap the spawn in `sh -c "ulimit -n 1024; exec slapd..."`
+    // so the child gets a sane descriptor cap before slapd runs.
+    let shell_cmd = format!(
+      "ulimit -n 1024; exec slapd -h {url} -f {conf} -d 0",
+      url = shell_escape(&url),
+      conf = shell_escape(&slapd_conf),
+    );
+    let process = Command::new("sh")
+      .arg("-c")
+      .arg(&shell_cmd)
       .stdout(Stdio::null())
       .stderr(Stdio::null())
       .spawn()?;
@@ -53,13 +61,10 @@ impl TestLdapServer {
       _data_dir: data_dir,
     };
 
-    server.wait_for_ready()?;
+    server.wait_for_ready().await?;
     Ok(server)
   }
 
-  /// Locates the OpenLDAP schema directory by inspecting the slapd binary
-  /// path.  Works correctly in a Nix store where slapd lives under
-  /// `<store>/libexec/` and schemas live under `<store>/etc/schema/`.
   fn find_schema_dir() -> Result<String, Box<dyn std::error::Error>> {
     if let Ok(output) = Command::new("which").arg("slapd").output() {
       if output.status.success() {
@@ -67,8 +72,8 @@ impl TestLdapServer {
           String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !slapd_path.is_empty() {
           let schema_dir = std::path::Path::new(&slapd_path)
-            .parent() // strip 'slapd'
-            .and_then(|p| p.parent()) // strip 'libexec'
+            .parent()
+            .and_then(|p| p.parent())
             .ok_or("Cannot derive OpenLDAP root from slapd path")?
             .join("etc")
             .join("schema");
@@ -129,7 +134,7 @@ maxsize 1073741824
     Ok(conf_path.to_string_lossy().to_string())
   }
 
-  fn wait_for_ready(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+  async fn wait_for_ready(&mut self) -> Result<(), Box<dyn std::error::Error>> {
     let delay = Duration::from_millis(100);
     for attempt in 0_u32..50 {
       if let Some(ref mut proc) = self.process {
@@ -139,9 +144,14 @@ maxsize 1073741824
           );
         }
       }
-      match ldap3::LdapConn::new(&self.url) {
-        Ok(_) => return Ok(()),
-        Err(_) if attempt < 49 => thread::sleep(delay),
+      match ldap3::LdapConnAsync::new(&self.url).await {
+        Ok((conn, _)) => {
+          tokio::spawn(async move {
+            let _ = conn.drive().await;
+          });
+          return Ok(());
+        }
+        Err(_) if attempt < 49 => tokio::time::sleep(delay).await,
         Err(e) => {
           return Err(
             format!("slapd not ready after 50 attempts: {}", e).into(),
@@ -152,14 +162,20 @@ maxsize 1073741824
     Ok(())
   }
 
-  /// Creates the base DN plus `ou=users` and `ou=groups` OUs, then returns
-  /// the bound connection so callers can perform additional setup.
-  pub fn initialize(
+  /// Creates the base DN plus `ou=users` and `ou=groups` OUs, then
+  /// returns a bound async LDAP handle so callers can perform any
+  /// additional setup their test needs.  The connection driver is
+  /// spawned on the current tokio runtime.
+  pub async fn initialize(
     &self,
-  ) -> Result<ldap3::LdapConn, Box<dyn std::error::Error>> {
-    let mut ldap = ldap3::LdapConn::new(&self.url)?;
+  ) -> Result<ldap3::Ldap, Box<dyn std::error::Error>> {
+    let (conn, mut ldap) = ldap3::LdapConnAsync::new(&self.url).await?;
+    tokio::spawn(async move {
+      let _ = conn.drive().await;
+    });
     ldap
-      .simple_bind(&self.bind_dn, &self.bind_password)?
+      .simple_bind(&self.bind_dn, &self.bind_password)
+      .await?
       .success()?;
 
     ldap
@@ -170,7 +186,8 @@ maxsize 1073741824
           ("dc", HashSet::from(["test"])),
           ("o", HashSet::from(["Test Organization"])),
         ],
-      )?
+      )
+      .await?
       .success()?;
 
     let users_dn = format!("ou=users,{}", self.base_dn);
@@ -181,7 +198,8 @@ maxsize 1073741824
           ("objectClass", HashSet::from(["organizationalUnit", "top"])),
           ("ou", HashSet::from(["users"])),
         ],
-      )?
+      )
+      .await?
       .success()?;
 
     let groups_dn = format!("ou=groups,{}", self.base_dn);
@@ -192,11 +210,20 @@ maxsize 1073741824
           ("objectClass", HashSet::from(["organizationalUnit", "top"])),
           ("ou", HashSet::from(["groups"])),
         ],
-      )?
+      )
+      .await?
       .success()?;
 
     Ok(ldap)
   }
+}
+
+/// Single-quote-escapes for /bin/sh.  Used to splice paths and URLs
+/// into the slapd launch command without worrying about spaces or
+/// metacharacters in tempdir names.
+fn shell_escape(s: &str) -> String {
+  let escaped = s.replace('\'', "'\\''");
+  format!("'{}'", escaped)
 }
 
 impl Drop for TestLdapServer {
