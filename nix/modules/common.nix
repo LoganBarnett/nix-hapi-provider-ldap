@@ -251,18 +251,29 @@
     // {inherit (user) __nixhapi;};
 
   # `members` lists user keys; the wire form is `member` carrying the
-  # composed DNs the LDAP server uses, sorted for stable equality with
-  # the live state the provider returns.
-  membersToWire = baseDn: members:
-    lib.sort builtins.lessThan
-    (map (uid: "uid=${uid},ou=users,${baseDn}") members);
+  # composed DNs the LDAP server uses.  Shape mirrors `live.rs`'s
+  # `normalise`: empty → null (stripped by `filterNulls`); single → a
+  # bare string; multiple → a lexicographically sorted array.  Keeping
+  # the desired-side projection in lockstep with the live-side
+  # projection is what makes the engine's structural compare idempotent
+  # on single-member groups instead of looping a no-op modify.
+  membersToWire = baseDn: members: let
+    dns =
+      lib.sort builtins.lessThan
+      (map (uid: "uid=${uid},ou=users,${baseDn}") members);
+  in
+    if dns == []
+    then null
+    else if builtins.length dns == 1
+    then builtins.head dns
+    else dns;
 
   groupToJson = baseDn: group:
-    filterNulls (removeAttrs group ["__nixhapi" "members"])
-    // {
-      inherit (group) __nixhapi;
-      member = membersToWire baseDn group.members;
-    };
+    filterNulls (
+      removeAttrs group ["__nixhapi" "members"]
+      // {member = membersToWire baseDn group.members;}
+    )
+    // {inherit (group) __nixhapi;};
 
   scopeToTree = scope: let
     baseDn = literalValue "provider.baseDn" scope.provider.baseDn;
