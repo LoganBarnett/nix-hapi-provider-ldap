@@ -1,64 +1,289 @@
-#+title:     <project-name>
+#+title:     nix-hapi-provider-ldap
 #+language:  en
 
 * Introduction
 
-Briefly describe the problem this project solves and how it solves it.
-Cover:
+A standalone provider binary for [[https://github.com/LoganBarnett/nix-hapi][nix-hapi]] that reconciles users
+and groups in an RFC-standard LDAP directory (OpenLDAP, 389 Directory
+Server, ApacheDS, OpenDJ — anything that speaks ~inetOrgPerson~ and
+~groupOfNames~).
 
-- What pain point or workflow does this address?
-- How does this project fit into a user's existing toolchain?
-- What are the two or three things a reader should know immediately?
+The user side is a NixOS or nix-darwin module: you describe the
+desired set of LDAP users and groups in Nix, the engine diffs that
+declaration against what the directory actually contains, and the
+provider applies whatever ~ldapadd~ / ~ldapmodify~ / ~ldapdelete~
+calls bring live state into agreement.  No state file, no Terraform,
+no one-off scripts.  Reruns are idempotent.
 
-Keep this section short — two or three paragraphs at most.
+Three things to know up front:
+
+- Each LDAP server is its own *scope* under
+  ~services.nix-hapi-ldap.scopes.<name>~.  A NixOS host may manage
+  several directories at once by adding more scopes.
+- Secrets (the admin bind password, per-user password hashes) are
+  expressed as paths via ~mkManagedFromPath~ / ~mkInitialFromPath~
+  so they can come from agenix / sops-nix without ever appearing in
+  the store.
+- Active Directory is *not* supported; AD's schema departs from the
+  RFC-standard one in ways that need a separate provider.
 
 * Installation
 
-Explain how to install the project.  Cover at minimum:
+Add the flake input alongside nix-hapi itself:
 
-- Installing from source (include any toolchain or system prerequisites).
-- Installing a pre-built release artifact, if applicable.
-- Installing the library crate via ~Cargo.toml~, if the project ships
-  one.
+#+begin_src nix :exports code
+{
+  inputs.nix-hapi.url = "github:LoganBarnett/nix-hapi";
+  inputs.nix-hapi-provider-ldap.url =
+    "github:LoganBarnett/nix-hapi-provider-ldap";
+}
+#+end_src
+
+Note: do *not* add ~inputs.nixpkgs.follows = "nixpkgs"~ on this
+input.  The provider pins its own nixpkgs (currently 25.11) and
+isn't tested against arbitrary other channels; overriding it can
+fail at build time on a derivation that depends on a particular
+nixpkgs revision.  The cost of carrying a second nixpkgs in the
+closure is closure size, which is fine in practice.
+
+Then import both modules in your NixOS configuration (or the
+~darwinModules.default~ pair on nix-darwin):
+
+#+begin_src nix :exports code
+{
+  imports = [
+    inputs.nix-hapi.nixosModules.default
+    inputs.nix-hapi-provider-ldap.nixosModules.default
+  ];
+}
+#+end_src
+
+The provider binary is built and supervised automatically once
+~services.nix-hapi.enable~ and ~services.nix-hapi-ldap.enable~ are
+both on.  No manual ~cargo build~ needed; the engine spawns the
+provider as a subprocess and talks JSON-RPC over its stdio.
 
 * Usage
 
-Show the most common invocations with concrete, copy-pasteable
-examples.  Prefer real-looking inputs and outputs over abstract
-placeholders.
+A minimal but realistic scope looks like this.  Everything below
+inherits from ~nix-hapi.lib~ — bring it in via ~with
+inputs.nix-hapi.lib;~ or fully-qualify each call.
 
-Organize sub-sections around the features a user is most likely to
-reach for first.  Avoid exhaustively listing every flag here — the
-~--help~ output covers that.
+#+begin_src nix :exports code
+{ inputs, ... }: let
+  inherit (inputs.nix-hapi.lib)
+    mkManaged mkInitial mkManagedFromPath mkInitialFromPath;
+in {
+  services.nix-hapi.enable      = true;
+  services.nix-hapi-ldap.enable = true;
+
+  services.nix-hapi-ldap.scopes."proton" = {
+    provider = {
+      url          = "ldaps://ldap.proton.lan";
+      baseDn       = "dc=proton,dc=lan";
+      bindDn       = "cn=admin,dc=proton,dc=lan";
+      bindPassword = mkManagedFromPath "/run/agenix/ldap-root-pw";
+    };
+
+    users."alice" = {
+      cn           = "Alice Smith";
+      sn           = "Smith";
+      mail         = "alice@proton.lan";
+      # Initial: written once on Add, then left alone.  Rotating the
+      # file on disk does NOT re-apply — that's mkManagedFromPath.
+      userPassword = mkInitialFromPath "/run/agenix/alice-pw-hashed";
+      loginShell   = "/run/current-system/sw/bin/bash";
+      # Freeform: arbitrary attributes pass through.  Lists become
+      # multi-valued LDAP attributes; the directory's set-equality
+      # comparison means order doesn't matter on rerun.
+      uidNumber    = 1001;
+      objectClass  = [ "top" "person" "inetOrgPerson" "posixAccount" ];
+      homeDirectory = "/home/alice";
+    };
+
+    users."bob" = {
+      cn           = "Bob Jones";
+      sn           = "Jones";
+      mail         = "bob@proton.lan";
+      userPassword = mkInitialFromPath "/run/agenix/bob-pw-hashed";
+    };
+
+    groups."engineering" = {
+      description = "Engineering team";
+      members     = [ "alice" "bob" ];  # uid keys, not full DNs
+    };
+  };
+}
+#+end_src
+
+The first reconcile creates the entries; subsequent reconciles diff
+against what's actually in the directory and apply only the deltas.
+If you later add a third user or extend ~members~, only that change
+hits the wire.
+
+** Provider connectivity
+
+The four ~provider~ fields map straight to LDAP semantics:
+
+- ~url~ — ~ldap://~, ~ldaps://~, or ~ldapi://~.  TLS is recommended
+  for anything off-loopback; the bind password travels in cleartext
+  on a plain ~ldap://~ connection.
+- ~baseDn~ — the parent under which the provider expects ~ou=users~
+  and ~ou=groups~ to exist.  Those two OUs are *not* auto-created;
+  bootstrap them once via a one-shot LDIF before the first
+  reconcile.  ~baseDn~ must be a literal string because the Nix
+  module substitutes it into ~providerKey~ DNs at evaluation time.
+- ~bindDn~ — the account the reconciler authenticates as.  Needs
+  write access under both OUs.
+- ~bindPassword~ — almost always ~mkManagedFromPath~ to an
+  agenix/sops-decrypted file.  The runbook output that the engine
+  prints scrubs this to ~***~ so plan diffs in CI / logs don't leak.
+
+All four are ~value~-typed, so you can also use ~mkManagedFromEnv~
+if you'd rather load via environment, or pass a bare string literal
+for non-secret fields.
+
+** Renaming users and groups
+
+LDAP entries change RDN over time — people change surnames, groups
+get rebranded, an internal-only ~uid~ collides with a new external
+SSO claim.  Tracking those renames declaratively is what the
+engine's ~providerKey~ history mechanism is for.
+
+The Nix submodule exposes ~__nixhapi.providerKey~ whose default is
+the auto-composed DN ~uid=<key>,ou=users,<baseDn>~ (or
+~cn=<key>,ou=groups,<baseDn>~ for groups).  Engine metadata lives
+under the reserved ~__nixhapi~ block — sibling to your LDAP
+attributes, never mixed in with them — so the names of fields you
+care about (~cn~, ~mail~, ~objectClass~, …) can never collide with
+nix-hapi internals.  To declare a rename, list the new DN first
+followed by every prior DN the entry has gone by:
+
+#+begin_src nix :exports code
+services.nix-hapi-ldap.scopes."proton" = {
+  provider = { /* … */ };
+
+  users."alicia" = {                  # attrset key is the *current* uid
+    cn           = "Alice Smith";
+    sn           = "Smith";
+    mail         = "alice@proton.lan";
+    userPassword = mkInitialFromPath "/run/agenix/alice-pw-hashed";
+    __nixhapi.providerKey = [
+      "uid=alicia,ou=users,dc=proton,dc=lan"   # head — must match key
+      "uid=alice,ou=users,dc=proton,dc=lan"    # prior DN
+    ];
+  };
+};
+#+end_src
+
+The next reconcile finds the live entry under ~uid=alice~ but no
+desired entry with that head; it falls back to the history,
+matches, and emits a ~Rename~ change.  The provider issues an LDAP
+~modifyDN~ — the entry keeps its DIT identity, group memberships
+referencing the old DN keep working, and any attribute not
+explicitly redeclared (~uidNumber~, ~loginShell~, etc.) is
+preserved.
+
+Keep the history entries.  They are part of the declared state, not
+a transient artefact you clean up after the first apply.  Future
+provider extensions (LDAP aliases, audit trails, identity-bridging
+to other systems) can act on them; pruning forces a clunky
+"apply-then-edit-to-prune-then-apply-again" cycle.
+
+The same mechanism works for groups by overriding ~providerKey~ on
+the group submodule.
+
+** Protecting unmanaged accounts
+
+A scope is *authoritative* by default: anything in ~ou=users~ or
+~ou=groups~ that isn't declared in Nix gets deleted on reconcile.
+That's usually what you want, but service accounts and apex DNs
+need an explicit carve-out.  ~ignore~ takes jq expressions that run
+against each live node body; a truthy result exempts the node from
+deletion.
+
+#+begin_src nix :exports code
+services.nix-hapi-ldap.scopes."proton" = {
+  provider = { /* … */ };
+
+  ignore = [
+    # Don't delete the directory-manager service account.
+    ''.__nixhapi.providerKey[0] == "uid=svc-directory,ou=users,dc=proton,dc=lan"''
+    # Don't delete anything tagged with a "system" description.
+    ''(.description // "") | test("^system:")''
+  ];
+
+  users."alice" = { /* … */ };
+};
+#+end_src
+
+The full node — including its ~__nixhapi.providerKey~ — is the jq
+input, so any attribute the live entry carries is fair game for
+matching.  Predicates only suppress *deletes*; an ignored DN that
+also appears in your desired state will still be diffed and
+modified normally.
 
 * Gotchas and Tradeoffs
 
-Document the non-obvious behaviors and design decisions that a user
-is likely to trip over:
-
-- Default behaviors that differ from what users might expect.
-- Known limitations (finite color palette, heuristic detection, etc.).
-- Performance or correctness tradeoffs made deliberately.
-- Anything where "it depends" or "by design" is the honest answer.
+- *Plain attrset-key renames are delete + recreate.*  Just changing
+  ~users.alice~ → ~users.alicia~ without listing the prior DN in
+  ~providerKey~ produces an Add + Delete — the engine has no idea
+  the two entries are related.  See *Renaming users and groups*
+  above for the declarative-rename pattern.
+- *Cross-OU moves work but aren't documented as a use case.*  Override
+  ~providerKey~ with a chain whose head and history live under
+  different parent DNs and the provider will pass ~newsuperior~ to
+  ~modifyDN~ — the LDAP server moves the entry.  This is supported
+  by the implementation but past the typical user/group hygiene
+  story, so don't be surprised if it interacts oddly with downstream
+  systems that hard-code parent DNs.
+- *Active Directory is unsupported.*  This provider hard-codes the
+  ~inetOrgPerson~ / ~groupOfNames~ object classes and ~uid~ / ~cn~
+  RDN conventions.  AD's ~user~ / ~group~ classes and
+  ~sAMAccountName~ RDN need their own provider.
+- *Multi-valued attributes use set equality.*  Declare ~objectClass
+  = [ "top" "person" "inetOrgPerson" ]~ in any order — the
+  reconciler sorts both sides before comparing, so list order
+  changes don't cause spurious modifies.
+- *~mkInitial~ vs ~mkManaged~ for passwords.*  ~mkInitial~ writes
+  once and never again — useful when users may later change their
+  password through some other channel.  ~mkManaged~ enforces the
+  declared hash on every reconcile, which will *clobber* any
+  out-of-band password change.  Pick deliberately.
+- *Single TCP connection per reconcile.*  ~list_live~ runs the
+  users and groups queries in parallel over one connection via
+  message-ID multiplexing, but ~apply~ operations execute
+  sequentially.  For directories with thousands of entries the
+  apply phase will be the bottleneck; in practice the typical
+  small-team scope is well below where this matters.
 
 * How to Exercise Various Features
 
-Provide a brief tour of less-obvious knobs:
-
-- Environment variables that mirror CLI flags.
-- Flags that interact non-trivially with each other.
-- Edge cases worth demonstrating (empty input, special characters,
-  large input, etc.).
-
-This section can be more terse than the main Usage section — its
-purpose is discoverability, not a tutorial.
+- *Plan without applying.*  The engine produces a runbook of LDIF
+  bodies before touching the directory.  Pipe the evaluated
+  desired-state JSON into ~nix-hapi plan~ to inspect the scrubbed
+  ~ldapmodify~ commands before committing — the NixOS / nix-darwin
+  modules only wire up an ~apply~ unit, so plan is a manual CLI
+  step.
+- *Mixed-source secrets.*  Combine ~mkManagedFromPath~ for the bind
+  password with ~mkInitialFromPath~ for per-user hashes when you
+  want server-side credential rotation to win over Nix
+  redeployment.
+- *Multiple scopes per host.*  Add as many
+  ~services.nix-hapi-ldap.scopes.<name>~ entries as you have
+  directories; each gets its own provider subprocess with its own
+  connection.
 
 * Contributing
 
-Summarize the contribution workflow and link to the full guide:
+Run the integration suite from inside the dev shell:
 
-- How to run the test suite.
-- Code formatting and lint requirements.
-- Where to open issues or send patches.
+#+begin_src sh :exports code
+nix develop --command cargo test --workspace
+#+end_src
 
-See [[file:CONTRIBUTING.org][CONTRIBUTING.org]] for details.
+The suite spins up a real ~slapd~ per test, so OpenLDAP must be on
+~PATH~ — the dev shell handles that on Linux and macOS.
+
+See [[file:CONTRIBUTING.org][CONTRIBUTING.org]] if present, or open an issue / PR on the
+GitHub repository.

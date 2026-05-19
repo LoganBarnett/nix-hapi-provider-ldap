@@ -675,3 +675,92 @@ async fn field_target_value_is_used_on_modify() {
     other => panic!("expected FieldTarget::Value, got {:?}", other),
   }
 }
+
+/// Renaming a user via providerKey history (head + prior DN) must produce
+/// a Status::Rename and result in a modrdn on the wire — *not* a delete +
+/// re-add.  The probe: declare the renamed user's userPassword as Initial
+/// with a different value than what was originally written.  modrdn
+/// preserves the entry's attributes, so the live password stays at the
+/// original value; a delete-then-add would write the new value.  The test
+/// asserts the original value survives.
+#[tokio::test]
+async fn rename_via_provider_key_history_uses_modrdn() {
+  let server = TestLdapServer::start().await.expect("start slapd");
+  server
+    .initialize()
+    .await
+    .expect("initialize base structure");
+
+  let provider = make_provider();
+  let config = make_config(&server);
+
+  // Step 1: create alice with userPassword = initial("first").
+  let desired1 = desired_only_users(
+    json!({ "alice": alice("Alice Smith", initial("first"), &server.base_dn) }),
+  );
+  plan_and_apply(&provider, &config, &desired1, &NixHapiMeta::default()).await;
+
+  // Step 2: declare the renamed-to entry, `alicia`, whose providerKey
+  // lists the new DN first and the prior DN second.  Pair it with an
+  // Initial password of a *different* value — modrdn preserves the
+  // entry body so the live password should still be "first" after this
+  // apply, not "second".
+  let alice_dn = format!("uid=alice,ou=users,{}", server.base_dn);
+  let alicia_dn = format!("uid=alicia,ou=users,{}", server.base_dn);
+  let desired2 = json!({
+    "users": {
+      "alicia": {
+        "__nixhapi": {
+          "providerKey": [alicia_dn.clone(), alice_dn.clone()],
+        },
+        "cn": managed("Alice Smith"),
+        "sn": managed("Smith"),
+        "mail": managed("alice@example.org"),
+        "userPassword": initial("second"),
+      },
+    },
+    "groups": {},
+  });
+
+  let live2 = provider.list_live(&config, &[]).await.expect("list_live 2");
+  let changes = compute_changes(&desired2, &live2, &NixHapiMeta::default());
+
+  // The engine should emit a Rename — head match failed (no live
+  // "uid=alicia"); history match succeeded against "uid=alice".
+  let renamed = changes.iter().any(|n| {
+    matches!(&n.status, Status::Rename { chain }
+      if chain.first().and_then(|v| v.as_str()) == Some(alice_dn.as_str())
+        && chain.last().and_then(|v| v.as_str()) == Some(alicia_dn.as_str()))
+  });
+  assert!(
+    renamed,
+    "expected Rename(alice → alicia) in changes; got: {:?}",
+    changes,
+  );
+
+  let wave = make_wave(changes, Vec::new());
+  let runbook = provider
+    .build_runbook(&wave, &desired2, &live2, &NixHapiMeta::default(), &config)
+    .await
+    .expect("build_runbook");
+  let wave = make_wave(wave.changes.clone(), runbook);
+  provider.apply(&wave, &config).await.expect("apply rename");
+
+  let live3 = provider.list_live(&config, &[]).await.expect("list_live 3");
+  assert!(
+    live3["users"]["alicia"].is_object(),
+    "alicia should exist after rename; live3 = {:?}",
+    live3,
+  );
+  assert!(
+    live3["users"]["alice"].is_null(),
+    "alice should be gone after rename; live3 = {:?}",
+    live3,
+  );
+  assert_eq!(
+    live3["users"]["alicia"]["userPassword"],
+    json!("first"),
+    "userPassword must be preserved through modrdn; \"second\" leaking \
+     here would indicate the entry was deleted and re-added instead",
+  );
+}

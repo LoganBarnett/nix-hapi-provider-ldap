@@ -50,63 +50,114 @@
   cfg = config.services.nix-hapi-ldap;
   value = nixHapiLib.types.value;
 
-  # User entry submodule.  Required attributes (cn, sn, mail, userPassword)
-  # are typed; optional ones (loginShell, description) default to null.
-  # `freeformType = attrsOf value` allows arbitrary additional LDAP
-  # attributes (uidNumber, telephoneNumber, objectClass, …) without
-  # enumerating every possible RFC schema field.  Each freeform value
-  # goes through the value type, so it gets the same tagged-value
-  # validation and bare-literal coercion (including list literals for
-  # multi-valued attributes).
-  userType = lib.types.submodule {
-    freeformType = lib.types.attrsOf value;
-    options = {
-      cn = lib.mkOption {
-        type = value;
-        description = "Common name (full display name).";
+  # Extracts the literal string from a value-typed (coercedTo) option.
+  # Required for fields like baseDn that we need to substitute into DN
+  # templates at evaluation time — path/env-backed bindings cannot be
+  # resolved without the reconciler running.
+  literalValue = field: v:
+    v.value
+    or (throw ''
+      services.nix-hapi-ldap: ${field} must be a literal string value;
+      path- or env-backed FieldValues cannot participate in DN
+      composition at evaluation time.
+    '');
+
+  # Engine-owned `__nixhapi` schema reused for every keyed node.
+  # `nixHapiLib.mkNodeMetaOption` carries the engine's canonical
+  # validation (non-empty `providerKey`, jq-expression `dependsOn`,
+  # strict on unknown sibling keys) so this module doesn't lockstep
+  # its schema with the reconciler — see `provider-api.org` >
+  # "Reserved-key discipline" in the engine docs for why.
+
+  # User entry submodule.  Parameterised on the scope's `baseDn` so
+  # the auto-composed `__nixhapi.providerKey` default can interpolate
+  # the full entry DN at option-default time, matching the documented
+  # engine pattern of "auto-derived head the user can override to
+  # declare a rename."  Required attributes (cn, sn, mail,
+  # userPassword) are typed; optional ones (loginShell, description)
+  # default to null.  `freeformType = attrsOf value` admits arbitrary
+  # additional LDAP attributes (uidNumber, telephoneNumber,
+  # objectClass, …) without enumerating every possible RFC schema
+  # field; each freeform value goes through the `value` type, so it
+  # gets the same tagged-value validation and bare-literal coercion
+  # (including list literals for multi-valued attributes).
+  mkUserType = baseDn:
+    lib.types.submodule ({name, ...}: {
+      freeformType = lib.types.attrsOf value;
+      options = {
+        __nixhapi = nixHapiLib.mkNodeMetaOption {
+          default = {
+            providerKey = ["uid=${name},ou=users,${baseDn}"];
+          };
+          description = ''
+            Engine metadata block.  Reserved namespace — anything in
+            here is consumed by the nix-hapi engine during
+            reconciliation, never written to the LDAP entry's
+            attribute set.  Default sets the providerKey head to the
+            entry's auto-composed DN; override `__nixhapi.providerKey`
+            with a longer list (head first, prior DNs after) to
+            declare a rename.
+          '';
+        };
+        cn = lib.mkOption {
+          type = value;
+          description = "Common name (full display name).";
+        };
+        sn = lib.mkOption {
+          type = value;
+          description = "Surname.";
+        };
+        mail = lib.mkOption {
+          type = value;
+          description = "Email address.";
+        };
+        userPassword = lib.mkOption {
+          type = value;
+          description = ''
+            Hashed password, typically wrapped via mkManagedFromPath or
+            mkInitialFromPath pointing at an agenix-decrypted hash file.
+          '';
+        };
+        loginShell = lib.mkOption {
+          type = lib.types.nullOr value;
+          default = null;
+          description = "Optional POSIX login shell path.";
+        };
+        description = lib.mkOption {
+          type = lib.types.nullOr value;
+          default = null;
+        };
       };
-      sn = lib.mkOption {
-        type = value;
-        description = "Surname.";
-      };
-      mail = lib.mkOption {
-        type = value;
-        description = "Email address.";
-      };
-      userPassword = lib.mkOption {
-        type = value;
-        description = ''
-          Hashed password, typically wrapped via mkManagedFromPath or
-          mkInitialFromPath pointing at an agenix-decrypted hash file.
-        '';
-      };
-      loginShell = lib.mkOption {
-        type = lib.types.nullOr value;
-        default = null;
-        description = "Optional POSIX login shell path.";
-      };
-      description = lib.mkOption {
-        type = lib.types.nullOr value;
-        default = null;
-      };
-    };
-  };
+    });
 
   # Group entry.  `members` is structural (the list of user keys this
-  # group claims), not a managed leaf — no value-type wrapping.
-  groupType = lib.types.submodule {
-    options = {
-      description = lib.mkOption {
-        type = lib.types.nullOr value;
-        default = null;
+  # group claims), not a managed leaf — no value-type wrapping.  Same
+  # `__nixhapi.providerKey` rename mechanism as users; the
+  # auto-composed default uses `cn=` since groupOfNames is keyed by
+  # cn.
+  mkGroupType = baseDn:
+    lib.types.submodule ({name, ...}: {
+      options = {
+        __nixhapi = nixHapiLib.mkNodeMetaOption {
+          default = {
+            providerKey = ["cn=${name},ou=groups,${baseDn}"];
+          };
+          description = ''
+            Engine metadata block.  See `users.<uid>.__nixhapi` for
+            the contract; same semantics apply here.
+          '';
+        };
+        description = lib.mkOption {
+          type = lib.types.nullOr value;
+          default = null;
+        };
+        members = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [];
+          description = "User keys that belong to this group.";
+        };
       };
-      members = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [];
-        description = "User keys that belong to this group.";
-      };
-    };
-  };
+    });
 
   providerCredsType = lib.types.submodule {
     options = {
@@ -129,7 +180,13 @@
     };
   };
 
-  scopeType = lib.types.submodule {
+  # `scopeType` is the function-form submodule so we can read
+  # `config.provider.baseDn` and thread it into the user/group
+  # submodules — they need it at option-default time to compose the
+  # auto-derived providerKey head.
+  scopeType = lib.types.submodule ({config, ...}: let
+    baseDn = literalValue "provider.baseDn" config.provider.baseDn;
+  in {
     options = {
       provider = lib.mkOption {
         type = providerCredsType;
@@ -144,7 +201,7 @@
         '';
       };
       users = lib.mkOption {
-        type = lib.types.attrsOf userType;
+        type = lib.types.attrsOf (mkUserType baseDn);
         default = {};
         description = ''
           Map of uid → user attributes.  Multiple modules may
@@ -153,7 +210,7 @@
         '';
       };
       groups = lib.mkOption {
-        type = lib.types.attrsOf groupType;
+        type = lib.types.attrsOf (mkGroupType baseDn);
         default = {};
         description = ''
           Map of cn → group attributes.  Member lists from multiple
@@ -163,14 +220,17 @@
         '';
       };
     };
-  };
+  });
 
   # Translate one typed scope into the JSON shape the rust reconciler
-  # expects: the scope's __nixhapi block carries provider config (and
+  # expects.  The scope's `__nixhapi` carries provider config (and
   # optionally an ignore list); each user/group node carries its own
-  # __nixhapi.providerKey (the entry's full DN) so the engine's diff
-  # can match desired↔live at user/group granularity instead of at the
-  # scope as a whole.
+  # `__nixhapi.providerKey` so the engine's diff can match desired↔live
+  # at user/group granularity and detect renames via history entries.
+  #
+  # The submodule already places `__nixhapi` exactly where the wire
+  # format wants it, so there is no lifting or namespace gymnastics
+  # here — the JSON shape mirrors the Nix shape one-to-one.
   #
   # Wire-format choices the reconciler relies on:
   #   * `ignore` is omitted entirely when empty.
@@ -181,26 +241,14 @@
   #
   # The provider's diff lives on the wire side, not in Nix, so things
   # like objectClass synthesis stay in the rust binary; the Nix module
-  # only emits what the user declared plus the providerKey envelope.
+  # only emits what the user declared.
   filterNulls = lib.filterAttrs (_: v: v != null);
 
-  # Extracts the literal string from a value-typed (coercedTo) option.
-  # Required for fields like baseDn that we need to substitute into DN
-  # templates at evaluation time — path/env-backed bindings cannot be
-  # resolved without the reconciler running.
-  literalValue = field: v:
-    v.value
-    or (throw ''
-      services.nix-hapi-ldap: ${field} must be a literal string value;
-      path- or env-backed FieldValues cannot participate in DN
-      composition at evaluation time.
-    '');
-
-  userToJson = baseDn: uid: user:
-    {
-      __nixhapi.providerKey = ["uid=${uid},ou=users,${baseDn}"];
-    }
-    // (filterNulls user);
+  # Body fields are everything outside `__nixhapi`, with explicit
+  # nulls stripped.  The `__nixhapi` block flows through untouched.
+  userToJson = user:
+    filterNulls (removeAttrs user ["__nixhapi"])
+    // {inherit (user) __nixhapi;};
 
   # `members` lists user keys; the wire form is `member` carrying the
   # composed DNs the LDAP server uses, sorted for stable equality with
@@ -209,12 +257,12 @@
     lib.sort builtins.lessThan
     (map (uid: "uid=${uid},ou=users,${baseDn}") members);
 
-  groupToJson = baseDn: cn: group:
-    {
-      __nixhapi.providerKey = ["cn=${cn},ou=groups,${baseDn}"];
+  groupToJson = baseDn: group:
+    filterNulls (removeAttrs group ["__nixhapi" "members"])
+    // {
+      inherit (group) __nixhapi;
       member = membersToWire baseDn group.members;
-    }
-    // (filterNulls (removeAttrs group ["members"]));
+    };
 
   scopeToTree = scope: let
     baseDn = literalValue "provider.baseDn" scope.provider.baseDn;
@@ -228,8 +276,8 @@
       // (lib.optionalAttrs (scope.ignore != []) {inherit (scope) ignore;});
   in {
     __nixhapi = meta;
-    users = lib.mapAttrs (userToJson baseDn) scope.users;
-    groups = lib.mapAttrs (groupToJson baseDn) scope.groups;
+    users = lib.mapAttrs (_: userToJson) scope.users;
+    groups = lib.mapAttrs (_: groupToJson baseDn) scope.groups;
   };
 in {
   options.services.nix-hapi-ldap = {

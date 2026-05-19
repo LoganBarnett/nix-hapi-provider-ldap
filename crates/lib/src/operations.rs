@@ -26,6 +26,14 @@ pub enum OperationError {
     source: LdapError,
   },
 
+  #[error("Failed to rename entry '{from_dn}' -> '{to_dn}': {source}")]
+  RenameFailed {
+    from_dn: String,
+    to_dn: String,
+    #[source]
+    source: LdapError,
+  },
+
   #[error("Failed to search under '{base}': {source}")]
   SearchFailed {
     base: String,
@@ -83,6 +91,38 @@ pub async fn entry_modify(
     .map(|_| ())
     .map_err(|source| OperationError::ModifyFailed {
       dn: dn.to_string(),
+      source,
+    })
+}
+
+/// Renames an entry via LDAP modifyDN.  `new_rdn` is just the
+/// leftmost RDN component (e.g. `uid=alicia`).  `new_sup` is
+/// `Some(parent_dn)` when the entry is also moving between
+/// containers, `None` for an in-place rename.  `delete_old` controls
+/// whether the previous RDN's attribute value is dropped from the
+/// entry's body — almost always true for our usage, since we want
+/// `uid=alicia` to replace `uid=alice` in the entry's attributes.
+pub async fn entry_modifydn(
+  ldap: &mut Ldap,
+  from_dn: &str,
+  new_rdn: &str,
+  delete_old: bool,
+  new_sup: Option<&str>,
+  to_dn: &str,
+) -> Result<(), OperationError> {
+  ldap
+    .modifydn(from_dn, new_rdn, delete_old, new_sup)
+    .await
+    .map_err(|source| OperationError::RenameFailed {
+      from_dn: from_dn.to_string(),
+      to_dn: to_dn.to_string(),
+      source,
+    })?
+    .success()
+    .map(|_| ())
+    .map_err(|source| OperationError::RenameFailed {
+      from_dn: from_dn.to_string(),
+      to_dn: to_dn.to_string(),
       source,
     })
 }

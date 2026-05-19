@@ -23,8 +23,20 @@ pub enum RunbookError {
     value: serde_json::Value,
   },
 
-  #[error("Rename support is not implemented yet (path={path:?})")]
-  RenameUnsupported { path: String },
+  #[error(
+    "Rename DiffNode for {path:?} has an empty chain — the engine \
+     guarantees length >= 2, so this indicates a malformed wave"
+  )]
+  EmptyRenameChain { path: String },
+
+  #[error(
+    "Rename DiffNode for {path:?} has a non-string chain entry; expected \
+     an LDAP DN, got {value}"
+  )]
+  NonStringRenameEntry {
+    path: String,
+    value: serde_json::Value,
+  },
 }
 
 /// Machine-executable representation of an LDAP operation, serialised
@@ -39,6 +51,19 @@ pub enum LdapOperation {
   },
   Modify {
     dn: String,
+    changes: Vec<LdapChange>,
+  },
+  /// modrdn (LDAP modifyDN) for renames declared via providerKey
+  /// history.  `from_dn` is the live DN we found the entry under;
+  /// `to_dn` is the desired head DN.  `new_sup` is computed at
+  /// apply-time from the two parent DNs — `None` when they match
+  /// (in-place rename), `Some` when the entry also moves between
+  /// containers.  `changes` are any non-rename field modifications
+  /// the engine flagged for the same node; they apply to `to_dn`
+  /// after the modrdn completes.
+  Rename {
+    from_dn: String,
+    to_dn: String,
     changes: Vec<LdapChange>,
   },
   Delete {
@@ -67,13 +92,23 @@ pub fn to_runbook_steps(
     .into_iter()
     .flatten()
     .collect();
-  // Adds first, then modifies, then deletes (children before parents).
+  // Adds (parents before children), then renames + modifies (each
+  // rename includes its own follow-up modify, so the two interleave
+  // safely), then deletes (children before parents so the server
+  // doesn't see orphans).  Renames sit before modifies because a
+  // stale Modify targeting the same DN as an in-flight Rename would
+  // race the modrdn — putting renames first keeps the wire ordering
+  // robust even if a future caller passes a misordered DiffNode
+  // forest.
   let (deletes, non_deletes): (Vec<_>, Vec<_>) = ops
     .into_iter()
     .partition(|op| matches!(op, LdapOperation::Delete { .. }));
-  let (adds, modifies): (Vec<_>, Vec<_>) = non_deletes
+  let (adds, rest): (Vec<_>, Vec<_>) = non_deletes
     .into_iter()
     .partition(|op| matches!(op, LdapOperation::Add { .. }));
+  let (renames, modifies): (Vec<_>, Vec<_>) = rest
+    .into_iter()
+    .partition(|op| matches!(op, LdapOperation::Rename { .. }));
   let adds = sorted_by_key(adds, |op| match op {
     LdapOperation::Add { dn, .. } => dn_depth(dn),
     _ => 0,
@@ -86,6 +121,7 @@ pub fn to_runbook_steps(
   let connect_args = scrubbed_connect_args(config);
   adds
     .into_iter()
+    .chain(renames)
     .chain(modifies)
     .chain(deletes)
     .map(|op| operation_to_step(op, &connect_args))
@@ -119,11 +155,11 @@ fn collect_ops(node: &DiffNode) -> Result<Vec<LdapOperation>, RunbookError> {
       })
     }
     Status::Delete => Some(LdapOperation::Delete { dn: dn.clone() }),
-    Status::Rename { .. } => {
-      return Err(RunbookError::RenameUnsupported {
-        path: node.path.clone(),
-      });
-    }
+    Status::Rename { chain } => Some(LdapOperation::Rename {
+      from_dn: dn_from_chain_entry(&node.path, chain.first(), 0)?,
+      to_dn: dn.clone(),
+      changes: changes_from_modify(&node.field_changes),
+    }),
   };
   let child_ops = node
     .children
@@ -148,6 +184,33 @@ fn dn_from_node(node: &DiffNode) -> Result<String, RunbookError> {
       value: head.clone(),
     }
   })
+}
+
+/// Pulls one DN out of a `Status::Rename` chain.  The engine
+/// guarantees the chain is non-empty (length >= 2 in practice), but
+/// the wire format is `Vec<Value>` so we have to range-check and
+/// reject non-string entries.
+fn dn_from_chain_entry(
+  path: &str,
+  entry: Option<&serde_json::Value>,
+  _idx: usize,
+) -> Result<String, RunbookError> {
+  let entry = entry.ok_or_else(|| RunbookError::EmptyRenameChain {
+    path: path.to_string(),
+  })?;
+  entry.as_str().map(String::from).ok_or_else(|| {
+    RunbookError::NonStringRenameEntry {
+      path: path.to_string(),
+      value: entry.clone(),
+    }
+  })
+}
+
+/// Splits a DN into `(leftmost-RDN, parent-DN)`.  Returns `None`
+/// when the DN has no comma (a root-suffix like `dc=org` on its own
+/// — not a shape our provider produces, but defensible).
+pub(crate) fn split_rdn_parent(dn: &str) -> Option<(&str, &str)> {
+  dn.split_once(',')
 }
 
 /// Builds the full attribute map for an Add by layering the user's
@@ -298,6 +361,16 @@ fn operation_to_step(
       body: Some(ldif_modify(dn, changes)),
       operation: serde_json::to_value(&op).unwrap_or(serde_json::Value::Null),
     },
+    LdapOperation::Rename {
+      from_dn,
+      to_dn,
+      changes,
+    } => RunbookStep {
+      description: format!("rename {} -> {}", from_dn, to_dn),
+      command: format!("ldapmodrdn {}", connect_args),
+      body: Some(ldif_modrdn(from_dn, to_dn, changes)),
+      operation: serde_json::to_value(&op).unwrap_or(serde_json::Value::Null),
+    },
     LdapOperation::Delete { dn } => RunbookStep {
       description: format!("delete {}", dn),
       command: format!("ldapdelete {} \"{}\"", connect_args, dn),
@@ -306,6 +379,36 @@ fn operation_to_step(
     },
   };
   Ok(step)
+}
+
+/// LDIF doesn't have a single grammar for "modrdn + follow-up
+/// modify", so the body is a human-readable two-section block: the
+/// modrdn line(s) first, then a divider and the standard
+/// `changetype: modify` LDIF for any follow-up field changes.  The
+/// operator can spot-check both halves before applying.
+fn ldif_modrdn(from_dn: &str, to_dn: &str, changes: &[LdapChange]) -> String {
+  let new_rdn = split_rdn_parent(to_dn).map(|(rdn, _)| rdn).unwrap_or(to_dn);
+  let modrdn_block = [
+    format!("dn: {}", from_dn),
+    "changetype: modrdn".to_string(),
+    format!("newrdn: {}", new_rdn),
+    "deleteoldrdn: 1".to_string(),
+  ]
+  .into_iter()
+  .chain(
+    split_rdn_parent(to_dn)
+      .zip(split_rdn_parent(from_dn))
+      .filter(|((_, to_parent), (_, from_parent))| to_parent != from_parent)
+      .map(|((_, to_parent), _)| format!("newsuperior: {}", to_parent)),
+  )
+  .collect::<Vec<_>>()
+  .join("\n");
+
+  // No field changes — just the modrdn block.
+  if changes.is_empty() {
+    return modrdn_block;
+  }
+  [modrdn_block, ldif_modify(to_dn, changes)].join("\n\n")
 }
 
 fn scrubbed_connect_args(config: &ResolvedLdapConfig) -> String {

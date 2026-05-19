@@ -5,10 +5,11 @@ use crate::live::{
   group_key_from_dn, group_to_json, user_key_from_dn, user_to_json,
 };
 use crate::operations::{
-  entry_add, entry_delete, entry_modify, list_entries, OperationError,
+  entry_add, entry_delete, entry_modify, entry_modifydn, list_entries,
+  OperationError,
 };
 use crate::runbook::{
-  to_runbook_steps, LdapChange, LdapOperation, RunbookError,
+  split_rdn_parent, to_runbook_steps, LdapChange, LdapOperation, RunbookError,
 };
 use async_trait::async_trait;
 use ldap3::{Ldap, Mod};
@@ -101,27 +102,39 @@ async fn execute_op(
     }
     LdapOperation::Modify { dn, changes } => {
       info!(dn = %dn, "Modifying entry");
-      let owned: Vec<(String, Vec<String>, bool)> = changes
-        .into_iter()
-        .map(|c| match c {
-          LdapChange::Replace { attr, values } => (attr, values, true),
-          LdapChange::Delete { attr } => (attr, Vec::new(), false),
-        })
-        .collect();
-      let mods: Vec<Mod<&str>> = owned
-        .iter()
-        .map(|(attr, values, is_replace)| {
-          if *is_replace {
-            let set: HashSet<&str> =
-              values.iter().map(String::as_str).collect();
-            Mod::Replace(attr.as_str(), set)
-          } else {
-            Mod::Delete(attr.as_str(), HashSet::new())
-          }
-        })
-        .collect();
-      entry_modify(ldap, &dn, mods).await.map_err(op_err)?;
+      apply_changes(ldap, &dn, changes).await?;
       report.modified.push(dn);
+    }
+    LdapOperation::Rename {
+      from_dn,
+      to_dn,
+      changes,
+    } => {
+      info!(from = %from_dn, to = %to_dn, "Renaming entry");
+      let (new_rdn, new_parent) =
+        split_rdn_parent(&to_dn).ok_or_else(|| {
+          ProviderError::OperationFailed(format!(
+            "rename target DN {:?} has no parent component",
+            to_dn
+          ))
+        })?;
+      let (_, from_parent) = split_rdn_parent(&from_dn).ok_or_else(|| {
+        ProviderError::OperationFailed(format!(
+          "rename source DN {:?} has no parent component",
+          from_dn
+        ))
+      })?;
+      // `new_sup` is only meaningful for cross-container moves; in
+      // our usual ou=users / ou=groups case the parents match and we
+      // pass `None` so the server treats it as an in-place rename.
+      let new_sup = (new_parent != from_parent).then_some(new_parent);
+      entry_modifydn(ldap, &from_dn, new_rdn, true, new_sup, &to_dn)
+        .await
+        .map_err(op_err)?;
+      if !changes.is_empty() {
+        apply_changes(ldap, &to_dn, changes).await?;
+      }
+      report.modified.push(to_dn);
     }
     LdapOperation::Delete { dn } => {
       info!(dn = %dn, "Deleting entry");
@@ -130,6 +143,35 @@ async fn execute_op(
     }
   }
   Ok(())
+}
+
+/// Applies a list of attribute-level changes (replace / delete) to
+/// `dn`.  Shared between `Modify` and the post-modrdn follow-up of
+/// `Rename`, both of which need exactly this dance.
+async fn apply_changes(
+  ldap: &mut Ldap,
+  dn: &str,
+  changes: Vec<LdapChange>,
+) -> Result<(), ProviderError> {
+  let owned: Vec<(String, Vec<String>, bool)> = changes
+    .into_iter()
+    .map(|c| match c {
+      LdapChange::Replace { attr, values } => (attr, values, true),
+      LdapChange::Delete { attr } => (attr, Vec::new(), false),
+    })
+    .collect();
+  let mods: Vec<Mod<&str>> = owned
+    .iter()
+    .map(|(attr, values, is_replace)| {
+      if *is_replace {
+        let set: HashSet<&str> = values.iter().map(String::as_str).collect();
+        Mod::Replace(attr.as_str(), set)
+      } else {
+        Mod::Delete(attr.as_str(), HashSet::new())
+      }
+    })
+    .collect();
+  entry_modify(ldap, dn, mods).await.map_err(op_err)
 }
 
 async fn query_live(
