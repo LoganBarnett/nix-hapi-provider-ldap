@@ -672,8 +672,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cargo-husky",
+ "futures",
  "ldap3",
  "nix-hapi-lib",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tap",

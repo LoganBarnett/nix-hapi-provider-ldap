@@ -1,9 +1,13 @@
 {
   description = "LDAP provider for nix-hapi";
   inputs = {
-    # LLM: Do NOT change this URL unless explicitly directed. This is the
-    # correct format for nixpkgs stable (25.11 is correct, not nixos-25.11).
-    nixpkgs.url = "github:NixOS/nixpkgs/25.11";
+    # LLM: Do NOT change this URL unless explicitly directed.  The bare
+    # `26.05` ref is a frozen release tag that never receives backports;
+    # `nixos-26.05` is the maintained release branch.  The branch is required
+    # here because `importCargoLock`'s fix to fetch crates from
+    # static.crates.io (crates.io now 403s generic curl User-Agents) exists
+    # only as a backport.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     rust-overlay.url = "github:oxalica/rust-overlay";
     crane.url = "github:ipetkov/crane";
     nix-hapi = {
@@ -83,7 +87,7 @@
       pkgs.treefmt
       pkgs.alejandra
       pkgs.elmPackages.elm-format
-      pkgs.nodePackages.prettier
+      pkgs.prettier
     ];
   in {
     # NixOS / nix-darwin modules.  Closure over `self` lets the package
@@ -99,35 +103,32 @@
       nixHapiLib = nix-hapi.lib;
     };
 
+    # Evaluates the module against nix/tests/sample.nix and compares the
+    # emitted tree with nix/tests/expected.json; see nix/tests/default.nix.
+    checks = forAllSystems (system: {
+      nix-module = import ./nix/tests/default.nix {
+        pkgs = pkgsFor system;
+        inherit self;
+        nixHapiLib = nix-hapi.lib;
+      };
+    });
+
     devShells = forAllSystems (system: let
       pkgs = pkgsFor system;
     in {
       default = pkgs.mkShell {
-        buildInputs = devPackages pkgs;
+        buildInputs =
+          devPackages pkgs
+          ++ [
+          ];
         shellHook = ''
           echo "nix-hapi-provider-ldap development environment"
           echo ""
           echo "Available Cargo packages (use 'cargo build -p <name>'):"
           cargo metadata --no-deps --format-version 1 2>/dev/null | \
-            jq -r '.packages[].name' | \
+            jq --raw-output '.packages[].name' | \
             sort | \
-            sed 's/^/  • /' || echo "  Run 'cargo init' to get started"
-
-          # Symlink cargo-husky hooks into .git/hooks/ using paths relative
-          # to .git/hooks/ so the repo stays valid after moves or copies.
-          _git_root=$(git rev-parse --show-toplevel 2>/dev/null)
-          if [ -n "$_git_root" ] && [ "$(pwd)" = "$_git_root" ] && [ -d ".cargo-husky/hooks" ]; then
-            for _hook in .cargo-husky/hooks/*; do
-              [ -x "$_hook" ] || continue
-              _name=$(basename "$_hook")
-              _dest="$_git_root/.git/hooks/$_name"
-              _target=$(${pkgs.coreutils}/bin/realpath --relative-to="$_git_root/.git/hooks" "$(pwd)/$_hook")
-              if [ ! -L "$_dest" ] || [ "$(readlink "$_dest")" != "$_target" ]; then
-                ln -sf "$_target" "$_dest"
-                echo "Installed git hook: $_name -> $_target"
-              fi
-            done
-          fi
+            sed 's/^/  - /' || echo "  Run 'cargo init' to get started"
         '';
       };
     });

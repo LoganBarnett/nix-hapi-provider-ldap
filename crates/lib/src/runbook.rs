@@ -1,7 +1,10 @@
 //! Translates a wave's `DiffNode` forest into runbook steps and the
-//! provider's internal `LdapOperation` representation.
+//! provider's internal `LdapOperation` representation, and refuses any
+//! operation aimed at a DN the configured search bases do not own.
 
 use crate::config::ResolvedLdapConfig;
+use crate::dn::{dn_depth, rdn_of, split_rdn_parent};
+use crate::search_base::SearchBase;
 use nix_hapi_lib::plan::{
   DiffNode, FieldDiff, FieldTarget, RunbookStep, Status,
 };
@@ -24,7 +27,7 @@ pub enum RunbookError {
   },
 
   #[error(
-    "Rename DiffNode for {path:?} has an empty chain — the engine \
+    "Rename DiffNode for {path:?} has an empty chain; the engine \
      guarantees length >= 2, so this indicates a malformed wave"
   )]
   EmptyRenameChain { path: String },
@@ -37,6 +40,25 @@ pub enum RunbookError {
     path: String,
     value: serde_json::Value,
   },
+
+  #[error(
+    "Add for entry {dn:?} declares no objectClass; LDAP requires at least one \
+     structural object class, so declare \"objectClass\" on the entry"
+  )]
+  AddMissingObjectClass { dn: String },
+
+  #[error(
+    "Add for entry {dn:?} has a DN whose leftmost component is not \
+     \"attribute=value\""
+  )]
+  AddDnWithoutRdn { dn: String },
+
+  #[error(
+    "Entry {dn:?} is outside every configured search base {bases:?}; the \
+     provider only manages the base entry of a \"base\" search, direct \
+     children of a \"one\" search, or strict descendants of a \"sub\" search"
+  )]
+  DnOutsideSearchBases { dn: String, bases: Vec<String> },
 }
 
 /// Machine-executable representation of an LDAP operation, serialised
@@ -56,7 +78,7 @@ pub enum LdapOperation {
   /// modrdn (LDAP modifyDN) for renames declared via providerKey
   /// history.  `from_dn` is the live DN we found the entry under;
   /// `to_dn` is the desired head DN.  `new_sup` is computed at
-  /// apply-time from the two parent DNs — `None` when they match
+  /// apply-time from the two parent DNs: `None` when they match
   /// (in-place rename), `Some` when the entry also moves between
   /// containers.  `changes` are any non-rename field modifications
   /// the engine flagged for the same node; they apply to `to_dn`
@@ -84,20 +106,24 @@ pub enum LdapChange {
 pub fn to_runbook_steps(
   changes: &[DiffNode],
   config: &ResolvedLdapConfig,
+  bases: &[SearchBase],
 ) -> Result<Vec<RunbookStep>, RunbookError> {
-  let ops: Vec<LdapOperation> = changes
-    .iter()
-    .map(collect_ops)
-    .collect::<Result<Vec<_>, _>>()?
-    .into_iter()
-    .flatten()
-    .collect();
+  let ops = ensure_covered(
+    changes
+      .iter()
+      .map(collect_ops)
+      .collect::<Result<Vec<_>, _>>()?
+      .into_iter()
+      .flatten()
+      .collect(),
+    bases,
+  )?;
   // Adds (parents before children), then renames + modifies (each
   // rename includes its own follow-up modify, so the two interleave
   // safely), then deletes (children before parents so the server
   // doesn't see orphans).  Renames sit before modifies because a
   // stale Modify targeting the same DN as an in-flight Rename would
-  // race the modrdn — putting renames first keeps the wire ordering
+  // race the modrdn; putting renames first keeps the wire ordering
   // robust even if a future caller passes a misordered DiffNode
   // forest.
   let (deletes, non_deletes): (Vec<_>, Vec<_>) = ops
@@ -136,6 +162,41 @@ fn sorted_by_key<T, K: Ord>(mut v: Vec<T>, key: impl FnMut(&T) -> K) -> Vec<T> {
   v
 }
 
+/// Rejects any operation aimed at a DN outside the configured search bases.
+/// Such an entry would be written but never read back as live, so every run
+/// would plan it again.  Deletes are exempt: they come from live state, which
+/// only ever holds covered entries.
+fn ensure_covered(
+  ops: Vec<LdapOperation>,
+  bases: &[SearchBase],
+) -> Result<Vec<LdapOperation>, RunbookError> {
+  let outside = ops
+    .iter()
+    .flat_map(desired_dns)
+    .find(|dn| !bases.iter().any(|base| base.covers(dn)))
+    .map(str::to_string);
+  match outside {
+    None => Ok(ops),
+    Some(dn) => Err(RunbookError::DnOutsideSearchBases {
+      dn,
+      bases: bases.iter().map(|base| base.url.clone()).collect(),
+    }),
+  }
+}
+
+/// The DNs an operation writes to, which are the ones that must be owned.
+fn desired_dns(op: &LdapOperation) -> Vec<&str> {
+  match op {
+    LdapOperation::Add { dn, .. } | LdapOperation::Modify { dn, .. } => {
+      vec![dn.as_str()]
+    }
+    LdapOperation::Rename { from_dn, to_dn, .. } => {
+      vec![from_dn.as_str(), to_dn.as_str()]
+    }
+    LdapOperation::Delete { .. } => Vec::new(),
+  }
+}
+
 /// Produces the flat list of LDAP operations for one diff subtree
 /// (the node itself plus everything underneath it).  An empty
 /// `Modify` is elided since `entry_modify` with no mods is a no-op
@@ -145,10 +206,10 @@ fn collect_ops(node: &DiffNode) -> Result<Vec<LdapOperation>, RunbookError> {
   let own_op = match &node.status {
     Status::Add => Some(LdapOperation::Add {
       dn: dn.clone(),
-      attrs: attrs_from_add(&node.field_changes, &dn),
+      attrs: attrs_from_add(&node.field_changes, &dn)?,
     }),
     Status::Modify => {
-      let changes = changes_from_modify(&node.field_changes);
+      let changes = changes_from_modify(&node.field_changes, &dn);
       (!changes.is_empty()).then_some(LdapOperation::Modify {
         dn: dn.clone(),
         changes,
@@ -158,7 +219,7 @@ fn collect_ops(node: &DiffNode) -> Result<Vec<LdapOperation>, RunbookError> {
     Status::Rename { chain } => Some(LdapOperation::Rename {
       from_dn: dn_from_chain_entry(&node.path, chain.first(), 0)?,
       to_dn: dn.clone(),
-      changes: changes_from_modify(&node.field_changes),
+      changes: changes_from_modify(&node.field_changes, &dn),
     }),
   };
   let child_ops = node
@@ -206,49 +267,93 @@ fn dn_from_chain_entry(
   })
 }
 
-/// Splits a DN into `(leftmost-RDN, parent-DN)`.  Returns `None`
-/// when the DN has no comma (a root-suffix like `dc=org` on its own
-/// — not a shape our provider produces, but defensible).
-pub(crate) fn split_rdn_parent(dn: &str) -> Option<(&str, &str)> {
-  dn.split_once(',')
-}
-
-/// Builds the full attribute map for an Add by layering the user's
-/// declared fields on top of the DN-derived defaults (objectClass +
-/// RDN attribute, plus the groupOfNames `member` placeholder when
-/// relevant).  `BTreeMap::from_iter` is last-write-wins, so defaults
-/// must come first in the chain for user values to override them.
-/// An empty user-declared `member` does *not* override the placeholder
-/// — groupOfNames forbids zero-member entries.
+/// Builds the attribute map for an Add from the declared fields.  The entry's
+/// RDN attribute always carries its naming value: declared values of that
+/// attribute (login aliases) are unioned with it, and when none are declared
+/// it is seeded from the DN, since an entry without its naming value is a
+/// namingViolation.  Attributes with no values are dropped because LDAP
+/// cannot store them.  `objectClass` must be declared; the provider assumes
+/// no schema and synthesises nothing else.
 fn attrs_from_add(
   field_changes: &[FieldDiff],
   dn: &str,
-) -> BTreeMap<String, Vec<String>> {
-  let user_attrs = field_changes
+) -> Result<BTreeMap<String, Vec<String>>, RunbookError> {
+  let (rdn_attr, rdn_value) = rdn_of(dn)
+    .ok_or_else(|| RunbookError::AddDnWithoutRdn { dn: dn.to_string() })?;
+  let declared: BTreeMap<String, Vec<String>> = field_changes
     .iter()
     .filter_map(|c| field_target_values(&c.to).map(|v| (c.field.clone(), v)))
-    .filter(|(k, v)| !(k == "member" && v.is_empty()));
-  defaults_for_dn(dn).into_iter().chain(user_attrs).collect()
+    .map(|(k, v)| match k.eq_ignore_ascii_case(rdn_attr) {
+      true => (k, with_rdn_value(rdn_value, v)),
+      false => (k, v),
+    })
+    .filter(|(_, v)| !v.is_empty())
+    .collect();
+  let naming = (!declared.keys().any(|k| k.eq_ignore_ascii_case(rdn_attr)))
+    .then(|| (rdn_attr.to_string(), vec![rdn_value.to_string()]));
+  let attrs: BTreeMap<String, Vec<String>> =
+    naming.into_iter().chain(declared).collect();
+  let has_object_class =
+    attrs.keys().any(|k| k.eq_ignore_ascii_case("objectClass"));
+  has_object_class
+    .then_some(attrs)
+    .ok_or_else(|| RunbookError::AddMissingObjectClass { dn: dn.to_string() })
 }
 
 /// Converts each `FieldDiff` in a Modify into a Replace (when a value
 /// is present) or a per-attribute Delete (when the field was removed).
-fn changes_from_modify(field_changes: &[FieldDiff]) -> Vec<LdapChange> {
+/// The entry's RDN attribute is the exception on both counts: its
+/// naming value can be neither replaced away nor deleted, so a Replace
+/// carries the RDN value ahead of the declared ones and a removal
+/// becomes a Replace back to the RDN value alone.
+fn changes_from_modify(
+  field_changes: &[FieldDiff],
+  dn: &str,
+) -> Vec<LdapChange> {
   field_changes
     .iter()
-    .map(|change| match &change.to {
-      FieldTarget::Value { value } => LdapChange::Replace {
+    .map(|change| match (&change.to, rdn_of(dn)) {
+      (FieldTarget::Value { value }, Some((attr, rdn_value)))
+        if change.field.eq_ignore_ascii_case(attr) =>
+      {
+        LdapChange::Replace {
+          attr: change.field.clone(),
+          values: with_rdn_value(rdn_value, scalar_or_array_to_strings(value)),
+        }
+      }
+      (FieldTarget::Removed, Some((attr, rdn_value)))
+        if change.field.eq_ignore_ascii_case(attr) =>
+      {
+        LdapChange::Replace {
+          attr: change.field.clone(),
+          values: vec![rdn_value.to_string()],
+        }
+      }
+      (FieldTarget::Value { value }, _) => LdapChange::Replace {
         attr: change.field.clone(),
         values: scalar_or_array_to_strings(value),
       },
-      FieldTarget::Removed => LdapChange::Delete {
+      (FieldTarget::Removed, _) => LdapChange::Delete {
         attr: change.field.clone(),
       },
-      FieldTarget::DerivedPlaceholder { inputs } => LdapChange::Replace {
+      (FieldTarget::DerivedPlaceholder { inputs }, _) => LdapChange::Replace {
         attr: change.field.clone(),
         values: vec![format_derived_display(inputs)],
       },
     })
+    .collect()
+}
+
+/// `rdn_value` first, then every declared value that is not a repeat
+/// of it; LDAP matches naming attributes case-insensitively, so so does
+/// the dedup.
+fn with_rdn_value(rdn_value: &str, declared: Vec<String>) -> Vec<String> {
+  std::iter::once(rdn_value.to_string())
+    .chain(
+      declared
+        .into_iter()
+        .filter(|v| !v.eq_ignore_ascii_case(rdn_value)),
+    )
     .collect()
 }
 
@@ -265,7 +370,7 @@ fn field_target_values(target: &FieldTarget) -> Option<Vec<String>> {
 /// Coerces a `serde_json::Value` to the LDAP attribute-value vector
 /// representation: arrays expand to their elements, scalars become a
 /// single-element vector, null becomes empty.  Non-scalar array
-/// elements are dropped — they have no LDAP representation.
+/// elements are dropped; they have no LDAP representation.
 fn scalar_or_array_to_strings(value: &serde_json::Value) -> Vec<String> {
   match value {
     serde_json::Value::Array(arr) => {
@@ -277,71 +382,16 @@ fn scalar_or_array_to_strings(value: &serde_json::Value) -> Vec<String> {
   }
 }
 
+/// Booleans take LDAP's own boolean syntax, matching what the Nix module
+/// emits, so a declared `true` compares equal to the stored `TRUE`.
 fn scalar_to_string(v: &serde_json::Value) -> Option<String> {
   match v {
     serde_json::Value::String(s) => Some(s.clone()),
     serde_json::Value::Number(n) => Some(n.to_string()),
-    serde_json::Value::Bool(b) => Some(b.to_string()),
+    serde_json::Value::Bool(true) => Some("TRUE".to_string()),
+    serde_json::Value::Bool(false) => Some("FALSE".to_string()),
     _ => None,
   }
-}
-
-/// Synthesises the entry-type-driven default attributes for an Add:
-/// objectClass, the RDN attribute (uid / cn), and (for groups) the
-/// groupOfNames `member` placeholder.  User-declared field changes
-/// layer on top of these in `attrs_from_add`; the only quirk is that
-/// an empty user-declared `member` is filtered out so the placeholder
-/// wins (groupOfNames forbids zero-member entries).
-///
-/// Returning a fresh map per call keeps the builder pure — no
-/// `&mut`-threading, no `entry().or_insert_with()` ceremony.
-fn defaults_for_dn(dn: &str) -> BTreeMap<String, Vec<String>> {
-  if dn.starts_with("uid=") {
-    let object_class = (
-      "objectClass".to_string(),
-      vec![
-        "inetOrgPerson".to_string(),
-        "organizationalPerson".to_string(),
-        "person".to_string(),
-        "top".to_string(),
-      ],
-    );
-    let uid =
-      crate::dn::rdn_value(dn, "uid").map(|u| ("uid".to_string(), vec![u]));
-    std::iter::once(object_class).chain(uid).collect()
-  } else if dn.starts_with("cn=") {
-    let object_class = (
-      "objectClass".to_string(),
-      vec!["groupOfNames".to_string(), "top".to_string()],
-    );
-    let cn =
-      crate::dn::rdn_value(dn, "cn").map(|c| ("cn".to_string(), vec![c]));
-    let placeholder_member = strip_rdn(dn, "cn").map(|suffix| {
-      (
-        "member".to_string(),
-        vec![format!("uid=placeholder,ou=users,{}", suffix)],
-      )
-    });
-    std::iter::once(object_class)
-      .chain(cn)
-      .chain(placeholder_member)
-      .collect()
-  } else {
-    BTreeMap::new()
-  }
-}
-
-fn strip_rdn<'a>(dn: &'a str, expected_attr: &str) -> Option<&'a str> {
-  let (rdn, rest) = dn.split_once(',')?;
-  let (attr, _) = rdn.split_once('=')?;
-  if !attr.trim().eq_ignore_ascii_case(expected_attr) {
-    return None;
-  }
-  let (ou, rest) = rest.split_once(',')?;
-  if !ou.trim().to_ascii_lowercase().starts_with("ou=") {
-    return None;
-  }
-  Some(rest)
 }
 
 fn operation_to_step(
@@ -404,7 +454,7 @@ fn ldif_modrdn(from_dn: &str, to_dn: &str, changes: &[LdapChange]) -> String {
   .collect::<Vec<_>>()
   .join("\n");
 
-  // No field changes — just the modrdn block.
+  // No field changes: just the modrdn block.
   if changes.is_empty() {
     return modrdn_block;
   }
@@ -457,10 +507,6 @@ fn change_to_ldif_block(change: &LdapChange) -> String {
     }
     LdapChange::Delete { attr } => format!("delete: {}", attr),
   }
-}
-
-fn dn_depth(dn: &str) -> usize {
-  dn.split(',').count()
 }
 
 fn format_derived_display(inputs: &BTreeMap<String, String>) -> String {

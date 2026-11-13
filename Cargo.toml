@@ -22,6 +22,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"]
 # that only exist to name intermediate results. Prefer .tap() over temporary
 # variables when it improves readability.
 tap = "1.0"
+# Fan-out over the configured search bases in list_live.  Already a
+# transitive dependency of ldap3, so this adds no compile units.
+futures = "0.3"
+# RFC 4516 percent-decoding of search base URLs.  Also transitive via ldap3.
+percent-encoding = "2"
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }

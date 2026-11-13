@@ -21,7 +21,7 @@ pub struct TestLdapServer {
 
 impl TestLdapServer {
   /// Spawns a slapd instance and waits until it accepts connections.
-  /// Async because the readiness probe uses async ldap3 — we are
+  /// Async because the readiness probe uses async ldap3; we are
   /// already inside a tokio runtime when called from a `#[tokio::test]`,
   /// so the sync `LdapConn::new` wrapper would error with
   /// "cannot start a runtime within a runtime".
@@ -111,6 +111,7 @@ impl TestLdapServer {
 include {s}/core.schema
 include {s}/cosine.schema
 include {s}/inetorgperson.schema
+include {s}/nis.schema
 
 pidfile {d}/slapd.pid
 argsfile {d}/slapd.args

@@ -1,85 +1,63 @@
 //! Builds the live-state JSON tree the engine consumes.
 //!
-//! The shape mirrors what the Nix module emits for desired state so the
-//! engine's diff has matching structure on both sides:
+//! The shape is a flat map keyed by DN, the same shape the Nix module emits
+//! for desired state, so the engine's diff has matching structure on both
+//! sides and Delete paths (which follow live) land where `ignore` and
+//! `derivedFrom` expressions written against desired expect them:
 //!
 //! ```json
-//! {
-//!   "users":  { "<uid>": { "__nixhapi": { "providerKey": ["<dn>"] }, ... } },
-//!   "groups": { "<cn>":  { "__nixhapi": { "providerKey": ["<dn>"] }, ... } }
-//! }
+//! { "entries": { "<dn>": { "__nixhapi": { "providerKey": ["<dn>"] }, ... } } }
 //! ```
 //!
-//! Per-entry attribute values are normalised so structural equality
-//! against the user's declared values produces the intended diffs:
+//! Per-entry attribute values are normalised so structural equality against
+//! the declared values produces the intended diffs:
 //!
-//! - Single-valued attributes become JSON scalars rather than
-//!   one-element arrays.
-//! - Multi-valued attributes are sorted lexicographically so set
-//!   semantics survive a strict-equality compare.
-//! - Attributes the engine should not see — the entry's RDN attribute
-//!   (`uid` / `cn`-of-group) and `objectClass` — are filtered out.  They
-//!   are implicit in the providerKey and re-synthesised by the provider
-//!   on Add operations.
+//! - Single-valued attributes become JSON scalars rather than one-element
+//!   arrays.
+//! - Multi-valued attributes are sorted lexicographically so set semantics
+//!   survive a strict-equality compare.
+//! - The RDN value is dropped from the entry's RDN attribute.  It is implicit
+//!   in the DN and re-synthesised on Add; further values of that attribute
+//!   stay visible, so declared login aliases diff cleanly.  `objectClass` is
+//!   an ordinary attribute here, because the provider assumes no schema.
 
-use crate::dn::{group_dn, rdn_value, user_dn};
+use crate::dn::rdn_of;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub type LiveAttrs = HashMap<String, Vec<String>>;
 
-/// Builds the per-user JSON object the engine diffs against.  `uid` is
-/// the entry's RDN value (the Nix attrset key); `base_dn` lets us
-/// compose the providerKey DN.
-pub fn user_to_json(uid: &str, base_dn: &str, attrs: &LiveAttrs) -> Value {
-  let mut obj = Map::new();
-  obj.insert(
-    "__nixhapi".to_string(),
-    json!({ "providerKey": [user_dn(uid, base_dn)] }),
-  );
-  insert_normalised_attrs(&mut obj, attrs, "uid");
-  Value::Object(obj)
+/// The whole live tree for a scope, keyed by DN as the server returned it.
+pub fn live_tree(entries: BTreeMap<String, LiveAttrs>) -> Value {
+  json!({
+    "entries": entries
+      .iter()
+      .map(|(dn, attrs)| (dn.clone(), entry_to_json(dn, attrs)))
+      .collect::<Map<String, Value>>(),
+  })
 }
 
-/// Builds the per-group JSON object the engine diffs against.  `cn`
-/// is the entry's RDN value (the Nix attrset key).
-pub fn group_to_json(cn: &str, base_dn: &str, attrs: &LiveAttrs) -> Value {
-  let mut obj = Map::new();
-  obj.insert(
-    "__nixhapi".to_string(),
-    json!({ "providerKey": [group_dn(cn, base_dn)] }),
-  );
-  insert_normalised_attrs(&mut obj, attrs, "cn");
-  Value::Object(obj)
-}
-
-/// Returns the RDN attribute name and the JSON key (uid/cn value) for
-/// a live DN under the conventional users/groups OUs.  Returns `None`
-/// when the DN doesn't carry a recognisable RDN.
-pub fn user_key_from_dn(dn: &str) -> Option<String> {
-  rdn_value(dn, "uid")
-}
-
-pub fn group_key_from_dn(dn: &str) -> Option<String> {
-  rdn_value(dn, "cn")
-}
-
-/// Adds each non-hidden attribute to `out`, converting single-valued
-/// attributes to scalars and sorting multi-valued ones.  `rdn_attr`
-/// (the entry's RDN attribute, e.g. `uid`) and `objectClass` are
-/// elided — they are provider-managed and not part of the diff.
-fn insert_normalised_attrs(
-  out: &mut Map<String, Value>,
-  attrs: &LiveAttrs,
-  rdn_attr: &str,
-) {
-  for (k, values) in attrs {
-    if k.eq_ignore_ascii_case(rdn_attr) || k.eq_ignore_ascii_case("objectClass")
-    {
-      continue;
-    }
-    out.insert(k.clone(), normalise(values));
-  }
+/// One entry as the engine diffs it.  The RDN attribute is matched
+/// case-insensitively, as is the RDN value within it, because LDAP matches
+/// the naming attributes this provider meets that way.
+pub fn entry_to_json(dn: &str, attrs: &LiveAttrs) -> Value {
+  let rdn = rdn_of(dn);
+  std::iter::once(("__nixhapi".to_string(), json!({ "providerKey": [dn] })))
+    .chain(attrs.iter().filter_map(|(attr, values)| {
+      let visible: Vec<String> = match rdn {
+        Some((rdn_attr, rdn_value)) if attr.eq_ignore_ascii_case(rdn_attr) => {
+          values
+            .iter()
+            .filter(|v| !v.eq_ignore_ascii_case(rdn_value))
+            .cloned()
+            .collect()
+        }
+        _ => values.clone(),
+      };
+      (!visible.is_empty()).then(|| (attr.clone(), normalise(&visible)))
+    }))
+    .collect::<Map<String, Value>>()
+    .into()
 }
 
 fn normalise(values: &[String]) -> Value {

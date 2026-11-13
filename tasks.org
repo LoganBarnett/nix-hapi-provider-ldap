@@ -291,3 +291,42 @@ run).
 Created =nix/lib/default.nix= with =mkLdapProvider=, =mkLdapUser=, and
 =mkLdapGroup= helpers that enforce required fields at Nix eval time.  Exported
 as =lib= from =flake.nix=.
+
+** DONE Login aliases via RDN-attribute extras                    :ldap:nix:
+:PROPERTIES:
+:CREATED: 2026-11-12
+:END:
+
+Extra values of an entry's RDN attribute are login aliases.  Live state elides
+only the naming value and keeps the rest, an Add unions the naming value with
+the declared extras, and a Modify carries it ahead of them, so the server never
+sees an entry without its naming value.  The Nix module elides the naming value
+the same way, so a declaration that lists it does not modify forever.
+
+** DONE Declarable objectClass                                    :ldap:nix:
+:PROPERTIES:
+:CREATED: 2026-11-12
+:END:
+
+=objectClass= is a required list on every entry and an ordinary attribute in
+live state.  The provider no longer synthesises =inetOrgPerson= or
+=groupOfNames=, nor a placeholder group member; the server enforces schema and
+the Modify error names the common violations.
+
+** DONE Generic DN-keyed entries with search bases                :ldap:nix:
+:PROPERTIES:
+:CREATED: 2026-11-12
+:END:
+
+Desired and live state are one flat =entries= map keyed by DN.  The declaration
+is the record: by default the provider reads the server's root DSE, owns every
+naming context it publishes except =unmanagedNamingContexts= (OpenLDAP's
+=cn=config= and =cn=monitor= by default), and deletes whatever is not declared.
+Explicit RFC 4516 search bases (=ldap:///<base>??<scope>?<filter>=) remain a
+provider-only override.  The Nix module declares each server as a tree of
+entries keyed by naming context and then by RDN, and checks DN collisions,
+key shape, providerKey heads and that no entry with children declares a
+rename, since renames are leaf-only and children carry the move.  =nix flake
+check= evaluates the module against a fixture.  The engine's
+=provider-api.org= still describes provider config as an untagged map; that
+is a follow-up in the engine repository.

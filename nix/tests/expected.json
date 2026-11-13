@@ -1,0 +1,194 @@
+{
+  "proton": {
+    "__nixhapi": {
+      "ignore": [
+        ".__nixhapi.providerKey[0] == \"cn=admin,dc=proton,dc=lan\""
+      ],
+      "provider": {
+        "bindDn": {
+          "__nixhapi": "managed",
+          "value": "cn=admin,dc=proton,dc=lan"
+        },
+        "bindPassword": {
+          "__nixhapi": "managed-from-path",
+          "path": "/run/agenix/ldap-root-pw"
+        },
+        "type": "ldap",
+        "unmanagedNamingContexts": {
+          "__nixhapi": "managed",
+          "value": [
+            "cn=config",
+            "cn=monitor"
+          ]
+        },
+        "url": {
+          "__nixhapi": "managed",
+          "value": "ldaps://ldap.proton.lan"
+        }
+      }
+    },
+    "entries": {
+      "cn=gitea,ou=web,ou=services,dc=proton,dc=lan": {
+        "__nixhapi": {
+          "dependsOn": [],
+          "providerKey": [
+            "cn=gitea,ou=web,ou=services,dc=proton,dc=lan"
+          ]
+        },
+        "description": {
+          "__nixhapi": "managed",
+          "value": "Gitea service"
+        },
+        "objectClass": {
+          "__nixhapi": "managed",
+          "value": "applicationProcess"
+        }
+      },
+      "cn=replicator,dc=proton,dc=lan": {
+        "__nixhapi": {
+          "dependsOn": [],
+          "providerKey": [
+            "cn=replicator,dc=proton,dc=lan"
+          ]
+        },
+        "objectClass": {
+          "__nixhapi": "managed",
+          "value": [
+            "organizationalRole",
+            "simpleSecurityObject"
+          ]
+        },
+        "userPassword": {
+          "__nixhapi": "managed-from-path",
+          "path": "/run/agenix/replicator-pw"
+        }
+      },
+      "dc=proton,dc=lan": {
+        "__nixhapi": {
+          "dependsOn": [],
+          "providerKey": [
+            "dc=proton,dc=lan"
+          ]
+        },
+        "o": {
+          "__nixhapi": "managed",
+          "value": "Proton"
+        },
+        "objectClass": {
+          "__nixhapi": "managed",
+          "value": [
+            "dcObject",
+            "organization"
+          ]
+        }
+      },
+      "ou=people,dc=proton,dc=lan": {
+        "__nixhapi": {
+          "dependsOn": [],
+          "providerKey": [
+            "ou=people,dc=proton,dc=lan"
+          ]
+        },
+        "objectClass": {
+          "__nixhapi": "managed",
+          "value": [
+            "organizationalUnit",
+            "top"
+          ]
+        }
+      },
+      "ou=services,dc=proton,dc=lan": {
+        "__nixhapi": {
+          "dependsOn": [],
+          "providerKey": [
+            "ou=services,dc=proton,dc=lan"
+          ]
+        },
+        "objectClass": {
+          "__nixhapi": "managed",
+          "value": "organizationalUnit"
+        }
+      },
+      "ou=web,ou=services,dc=proton,dc=lan": {
+        "__nixhapi": {
+          "dependsOn": [],
+          "providerKey": [
+            "ou=web,ou=services,dc=proton,dc=lan"
+          ]
+        },
+        "objectClass": {
+          "__nixhapi": "managed",
+          "value": "organizationalUnit"
+        }
+      },
+      "uid=alice,ou=people,dc=proton,dc=lan": {
+        "__nixhapi": {
+          "dependsOn": [],
+          "providerKey": [
+            "uid=alice,ou=people,dc=proton,dc=lan"
+          ]
+        },
+        "cn": {
+          "__nixhapi": "managed",
+          "value": "Alice Smith"
+        },
+        "mail": {
+          "__nixhapi": "managed",
+          "value": [
+            "a.smith@proton.lan",
+            "alice@proton.lan"
+          ]
+        },
+        "objectClass": {
+          "__nixhapi": "managed",
+          "value": [
+            "inetOrgPerson",
+            "person",
+            "top"
+          ]
+        },
+        "shadowInactive": {
+          "__nixhapi": "managed",
+          "value": "TRUE"
+        },
+        "sn": {
+          "__nixhapi": "managed",
+          "value": "Smith"
+        },
+        "uid": {
+          "__nixhapi": "managed",
+          "value": "asmith"
+        },
+        "uidNumber": {
+          "__nixhapi": "managed",
+          "value": "1001"
+        },
+        "userPassword": {
+          "__nixhapi": "initial-from-path",
+          "path": "/run/agenix/alice-pw-hashed"
+        }
+      },
+      "uid=bobby,ou=people,dc=proton,dc=lan": {
+        "__nixhapi": {
+          "dependsOn": [],
+          "providerKey": [
+            "uid=bobby,ou=people,dc=proton,dc=lan",
+            "uid=bob,ou=people,dc=proton,dc=lan"
+          ]
+        },
+        "cn": {
+          "__nixhapi": "managed",
+          "value": "Bob Jones"
+        },
+        "objectClass": {
+          "__nixhapi": "managed",
+          "value": "inetOrgPerson"
+        },
+        "sn": {
+          "__nixhapi": "managed",
+          "value": "Jones"
+        }
+      }
+    }
+  }
+}

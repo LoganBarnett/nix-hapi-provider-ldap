@@ -1,23 +1,23 @@
-use crate::config::ResolvedLdapConfig;
+use crate::config::{Ownership, ResolvedLdapConfig};
 use crate::connection::connect;
-use crate::dn::{ou_groups_dn, ou_users_dn};
-use crate::live::{
-  group_key_from_dn, group_to_json, user_key_from_dn, user_to_json,
-};
+use crate::dn::{same_dn, split_rdn_parent};
+use crate::live::{live_tree, LiveAttrs};
 use crate::operations::{
   entry_add, entry_delete, entry_modify, entry_modifydn, list_entries,
-  OperationError,
+  naming_contexts, OperationError,
 };
 use crate::runbook::{
-  split_rdn_parent, to_runbook_steps, LdapChange, LdapOperation, RunbookError,
+  to_runbook_steps, LdapChange, LdapOperation, RunbookError,
 };
+use crate::search_base::SearchBase;
 use async_trait::async_trait;
+use futures::future::try_join_all;
 use ldap3::{Ldap, Mod};
 use nix_hapi_lib::meta::NixHapiMeta;
 use nix_hapi_lib::plan::{ApplyReport, ProviderPlanWave, RunbookStep};
 use nix_hapi_lib::provider::{Filter, Provider, ProviderError, ResolvedConfig};
-use serde_json::{Map, Value};
-use std::collections::HashSet;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
 use tracing::info;
 
 pub struct LdapProvider;
@@ -39,9 +39,8 @@ impl Provider for LdapProvider {
   ) -> Result<Value, ProviderError> {
     let ldap_config = ResolvedLdapConfig::from_resolved_config(config)?;
     let mut ldap = connect(&ldap_config).await?;
-    query_live(&mut ldap, &ldap_config)
-      .await
-      .map_err(|e| ProviderError::OperationFailed(e.to_string()))
+    let bases = owned_bases(&mut ldap, &ldap_config).await.map_err(op_err)?;
+    query_live(&ldap, &bases).await.map_err(op_err)
   }
 
   async fn build_runbook(
@@ -53,7 +52,8 @@ impl Provider for LdapProvider {
     config: &ResolvedConfig,
   ) -> Result<Vec<RunbookStep>, ProviderError> {
     let ldap_config = ResolvedLdapConfig::from_resolved_config(config)?;
-    to_runbook_steps(&wave.changes, &ldap_config).map_err(runbook_err)
+    let bases = bases_for_planning(&ldap_config).await?;
+    to_runbook_steps(&wave.changes, &ldap_config, &bases).map_err(runbook_err)
   }
 
   async fn apply(
@@ -63,10 +63,11 @@ impl Provider for LdapProvider {
   ) -> Result<ApplyReport, ProviderError> {
     let ldap_config = ResolvedLdapConfig::from_resolved_config(config)?;
     let mut ldap = connect(&ldap_config).await?;
+    let bases = owned_bases(&mut ldap, &ldap_config).await.map_err(op_err)?;
     let mut report = ApplyReport::default();
 
-    let steps =
-      to_runbook_steps(&wave.changes, &ldap_config).map_err(runbook_err)?;
+    let steps = to_runbook_steps(&wave.changes, &ldap_config, &bases)
+      .map_err(runbook_err)?;
     for step in steps {
       let op: LdapOperation = serde_json::from_value(step.operation.clone())
         .map_err(|e| {
@@ -124,9 +125,9 @@ async fn execute_op(
           from_dn
         ))
       })?;
-      // `new_sup` is only meaningful for cross-container moves; in
-      // our usual ou=users / ou=groups case the parents match and we
-      // pass `None` so the server treats it as an in-place rename.
+      // `new_sup` is only meaningful for a move between containers; when
+      // the parents match we pass `None` so the server treats it as an
+      // in-place rename.
       let new_sup = (new_parent != from_parent).then_some(new_parent);
       entry_modifydn(ldap, &from_dn, new_rdn, true, new_sup, &to_dn)
         .await
@@ -174,58 +175,72 @@ async fn apply_changes(
   entry_modify(ldap, dn, mods).await.map_err(op_err)
 }
 
-async fn query_live(
+/// The search bases the provider owns.  Explicit bases come straight from
+/// the configuration.  Otherwise every naming context the server publishes
+/// is owned in full, minus the unmanaged ones, in a deterministic order.
+async fn owned_bases(
   ldap: &mut Ldap,
   config: &ResolvedLdapConfig,
-) -> Result<Value, OperationError> {
-  // `Ldap` is `Clone`; cloned handles share the connection driver but
-  // can issue concurrent searches because ldap3 multiplexes requests
-  // by message ID.  So the two base queries genuinely run in parallel
-  // over the same TCP connection.
-  let users_base = ou_users_dn(&config.base_dn);
-  let groups_base = ou_groups_dn(&config.base_dn);
-  let mut ldap_users = ldap.clone();
-  let mut ldap_groups = ldap.clone();
-  let (user_entries, group_entries) = tokio::try_join!(
-    list_entries(&mut ldap_users, &users_base),
-    list_entries(&mut ldap_groups, &groups_base),
-  )?;
-
-  let users = entries_to_object(
-    user_entries,
-    |dn| user_key_from_dn(dn),
-    |k, attrs| user_to_json(k, &config.base_dn, attrs),
-  );
-  let groups = entries_to_object(
-    group_entries,
-    |dn| group_key_from_dn(dn),
-    |k, attrs| group_to_json(k, &config.base_dn, attrs),
-  );
-
-  Ok(serde_json::json!({
-    "users": Value::Object(users),
-    "groups": Value::Object(groups),
-  }))
+) -> Result<Vec<SearchBase>, OperationError> {
+  match &config.ownership {
+    Ownership::SearchBases(bases) => Ok(bases.clone()),
+    Ownership::NamingContexts { unmanaged } => {
+      naming_contexts(ldap).await.map(|contexts| {
+        contexts
+          .into_iter()
+          .filter(|context| !unmanaged.iter().any(|u| same_dn(u, context)))
+          .map(|context| (context.clone(), SearchBase::subtree(&context)))
+          .collect::<BTreeMap<String, SearchBase>>()
+          .into_values()
+          .collect()
+      })
+    }
+  }
 }
 
-/// Folds a list of `(dn, attrs)` pairs into a JSON object keyed by
-/// whatever `extract_key` derives from the DN (uid for users, cn for
-/// groups).  Entries whose DN doesn't yield a key are skipped — those
-/// are not entries this provider owns.
-fn entries_to_object(
-  entries: Vec<(String, std::collections::HashMap<String, Vec<String>>)>,
-  extract_key: impl Fn(&str) -> Option<String>,
-  to_json: impl Fn(&str, &std::collections::HashMap<String, Vec<String>>) -> Value,
-) -> Map<String, Value> {
-  entries
-    .into_iter()
-    .filter_map(|(dn, attrs)| {
-      extract_key(&dn).map(|key| {
-        let json = to_json(&key, &attrs);
-        (key, json)
-      })
+/// Planning needs the owned bases to refuse entries outside them.  Explicit
+/// bases need no connection; discovered ones are read from the server.
+async fn bases_for_planning(
+  config: &ResolvedLdapConfig,
+) -> Result<Vec<SearchBase>, ProviderError> {
+  match &config.ownership {
+    Ownership::SearchBases(bases) => Ok(bases.clone()),
+    Ownership::NamingContexts { .. } => {
+      let mut ldap = connect(config).await?;
+      owned_bases(&mut ldap, config).await.map_err(op_err)
+    }
+  }
+}
+
+/// Every entry one search base returns and covers.  Filtering by the same
+/// predicate the runbook validates against keeps live state and the coverage
+/// check from ever disagreeing.
+async fn covered_entries(
+  mut ldap: Ldap,
+  base: &SearchBase,
+) -> Result<Vec<(String, LiveAttrs)>, OperationError> {
+  list_entries(&mut ldap, &base.base, base.scope.ldap_scope(), &base.filter)
+    .await
+    .map(|entries| {
+      entries
+        .into_iter()
+        .filter(|(dn, _)| base.covers(dn))
+        .collect()
     })
-    .collect()
+}
+
+/// The live tree: every search base queried in parallel and folded into one
+/// map keyed by DN.  `Ldap` is `Clone`; cloned handles share the connection
+/// driver but can issue concurrent searches because ldap3 multiplexes
+/// requests by message ID, so all bases run over one TCP connection.  The
+/// map also deduplicates an entry that overlapping bases return twice.
+async fn query_live(
+  ldap: &Ldap,
+  bases: &[SearchBase],
+) -> Result<Value, OperationError> {
+  try_join_all(bases.iter().map(|base| covered_entries(ldap.clone(), base)))
+    .await
+    .map(|per_base| live_tree(per_base.into_iter().flatten().collect()))
 }
 
 fn op_err(e: OperationError) -> ProviderError {
